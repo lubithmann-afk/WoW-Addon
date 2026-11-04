@@ -1,0 +1,12 @@
+## Interface: 16001
+## Title: AHWatch
+## Notes: Auction house watch list and sell helper: one-key buying, bag selling advice, price history, graphs, tooltips, and price-trend arrows on crafting mats.
+## Author: Luke Mann
+## Version: 1.6
+## SavedVariables: AHWatchDB, AHWatchPrices, AHWatchItemsData
+
+AHWatch.lua
+Prices.lua
+Sell.lua
+Theme.lua
+Bags.lua
