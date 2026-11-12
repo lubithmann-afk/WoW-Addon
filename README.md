@@ -1,7 +1,7 @@
 # AHWatch
 Auction house add-on for Wow forever.
 
-Watch list with one-key buying, a ledger of everything you bought, bag selling advice, Quick Sell, price history with graphs and tooltips (can be hidden), flip opportunities, and price-trend arrows on crafting materials.
+Watch list with one-key buying, "% below market" next to every price, a ledger of what you bought and what you earned selling, bag selling advice, Quick Sell, price history with graphs and tooltips (can be hidden), flip opportunities, and price-trend arrows on crafting materials.
 
 ## Install
 1. Click **Code → Download ZIP** on this page.

@@ -183,16 +183,71 @@ local function TrustedQty(day) return (day[5] or 0) >= ((AHWatchDB and AHWatchDB
 -- listed. Taking the median across several such days on top of that still
 -- protects against one unusually quiet or unusually flooded day. Returns
 -- the price and how many days it's based on.
+-- Worked out once per item and reused until that item gets a new price
+-- (it used to be re-sorted every time anything was redrawn).
+local typicalCache = {}
+function ns.ClearTypicalCache() typicalCache = {} end
+
 function ns.GetTypicalPrice(itemID)
+    local c = typicalCache[itemID]
+    if c then return c[1] or nil, c[2] end
     local it = runtimeItems[itemID]
-    if not it or not it.d then return nil end
-    local avgs = {}
-    for _, d in ipairs(it.d) do
-        if d[4] and d[4] > 0 and TrustedQty(d) then table.insert(avgs, d[4]) end
+    local price, days
+    if it and it.d then
+        local avgs = {}
+        for _, d in ipairs(it.d) do
+            if d[4] and d[4] > 0 and TrustedQty(d) then table.insert(avgs, d[4]) end
+        end
+        if #avgs > 0 then
+            table.sort(avgs)
+            price, days = Median(avgs), #avgs
+        end
     end
-    if #avgs == 0 then return nil end
-    table.sort(avgs)
-    return Median(avgs), #avgs
+    typicalCache[itemID] = { price or false, days }
+    return price, days
+end
+
+-- THE market price, used everywhere in the addon (max-price %, the "% below
+-- market" notes, the Sell tab, the ledger): your own saved history once it
+-- has 2+ reliable days, otherwise Auctionator's price if it's installed,
+-- otherwise whatever single day of history there is.
+local MIN_MARKET_DAYS = 2
+function ns.MarketPrice(itemID)
+    if not itemID then return nil end
+    local typical, days = ns.GetTypicalPrice(itemID)
+    if typical and days >= MIN_MARKET_DAYS then return math.floor(typical), "history", days end
+    local api = Auctionator and Auctionator.API and Auctionator.API.v1
+    if api and api.GetAuctionPriceByItemID then
+        local ok, p = pcall(api.GetAuctionPriceByItemID, "AHWatch", itemID)
+        if ok and p and p > 0 then return p, "auctionator", 0 end
+    end
+    if typical then return math.floor(typical), "history", days end
+    return nil
+end
+
+-- Compact money text for notes: "2s", "1s 60c", "12g 5s"
+function ns.ShortMoney(copper)
+    copper = math.floor((copper or 0) + 0.5)
+    local g, sv, c = math.floor(copper / 10000), math.floor(copper / 100) % 100, copper % 100
+    local parts = {}
+    if g > 0 then parts[#parts + 1] = g .. "g" end
+    if sv > 0 then parts[#parts + 1] = sv .. "s" end
+    if c > 0 or #parts == 0 then parts[#parts + 1] = c .. "c" end
+    return table.concat(parts, " ")
+end
+
+-- How a price compares with the market: "50% below market (2s)"
+function ns.VsMarket(itemID, price)
+    if not itemID or not price or price <= 0 then return "" end
+    local m = ns.MarketPrice(itemID)
+    if not m or m <= 0 then return "|cff888888no market price yet|r" end
+    local pct = (price - m) / m * 100
+    local ms = " |cffaaaaaa(" .. ns.ShortMoney(m) .. ")|r"
+    if math.abs(pct) < 0.5 then return "|cffffffffat market|r" .. ms end
+    if pct < 0 then
+        return string.format("|cff33dd66%d%% below market|r", math.floor(-pct + 0.5)) .. ms
+    end
+    return string.format("|cffff6666%d%% above market|r", math.floor(pct + 0.5)) .. ms
 end
 
 -- Day-over-day change for an item: today's saved daily-average price vs the
@@ -226,6 +281,7 @@ end
 
 local function Record(itemID, low, avg, qty, t)
     if not itemID or not low or low <= 0 then return end
+    typicalCache[itemID] = nil
     local it = runtimeItems[itemID]
     if not it then
         it = { d = {} }
@@ -269,7 +325,9 @@ function ns.RecordRows(itemID, rows, isCommodity)
     for _, r in ipairs(rows or {}) do
         local q = r.quantity or 1
         local unit = isCommodity and r.unitPrice or (r.buyout and r.buyout / math.max(q, 1))
-        if unit and unit > 0 then
+        -- Your own listings don't count: posting a big stack shouldn't move
+        -- the price you're basing your own decisions on
+        if unit and unit > 0 and not r.own then
             if not low or unit < low then low = unit end
             qty = qty + q
             table.insert(units, { unit, q })
@@ -314,6 +372,7 @@ local function Prune()
     for _, c in ipairs(candidates) do
         size = size - (#EncodeOne(c.id, runtimeItems[c.id]) + 1)
         runtimeItems[c.id] = nil
+        typicalCache[c.id] = nil
         removed = removed + 1
         if size <= limit then break end
     end
@@ -350,6 +409,8 @@ local function ProcessReplicate()
     local agg, idx, listings = {}, 0, 0
     local clock = debugprofilestop
     local toRecord, recIdx = nil, 0   -- second pass: saving each item, also spread over frames
+    local PACK = 100000
+    local me = UnitName and UnitName("player")
     local scanTime = time()
     local function Step()
         local started = clock and clock()
@@ -359,7 +420,16 @@ local function ProcessReplicate()
                 recIdx = recIdx + 1
                 local itemID = toRecord[recIdx]
                 local a = agg[itemID]
-                Record(itemID, a.low, a.sum / a.qty, a.qty, scanTime)
+                -- The price of the middle unit of everything listed (same as a search)
+                table.sort(a.v)
+                local half, cum, typical = a.qty / 2, 0, a.low
+                for _, packed in ipairs(a.v) do
+                    cum = cum + packed % PACK
+                    typical = math.floor(packed / PACK)
+                    if cum >= half then break end
+                end
+                Record(itemID, a.low, typical, a.qty, scanTime)
+                agg[itemID] = nil
                 if clock and (recIdx % 200 == 0) and clock() - started > FRAME_BUDGET_MS then break end
             end
             progress = 90 + math.floor(recIdx / math.max(#toRecord, 1) * 10)
@@ -371,17 +441,19 @@ local function ProcessReplicate()
         end
         local stop = clock and n or math.min(idx + FALLBACK_CHUNK, n)
         for i = idx, stop - 1 do
-            local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, _, itemID = C_AuctionHouse.GetReplicateItemInfo(i)
-            if itemID and buyout and buyout > 0 and count and count > 0 then
+            local _, _, count, _, _, _, _, _, _, buyout, _, _, _, owner, _, _, itemID = C_AuctionHouse.GetReplicateItemInfo(i)
+            if itemID and buyout and buyout > 0 and count and count > 0 and (not me or owner ~= me) then
                 local unit = buyout / count
                 local a = agg[itemID]
                 if not a then
-                    a = { low = unit, sum = 0, qty = 0 }
+                    a = { low = unit, qty = 0, v = {} }
                     agg[itemID] = a
                 end
                 if unit < a.low then a.low = unit end
-                a.sum = a.sum + buyout
                 a.qty = a.qty + count
+                -- Each listing packed into one number (price, then amount) -
+                -- far lighter than a table per listing on a big auction house
+                a.v[#a.v + 1] = math.floor(unit + 0.5) * PACK + math.min(count, PACK - 1)
                 listings = listings + 1
             end
             idx = i + 1

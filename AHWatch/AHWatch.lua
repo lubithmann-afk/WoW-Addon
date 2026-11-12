@@ -27,6 +27,7 @@ local searchAuto = false        -- the search in progress was started by the add
 local pendingBids = {}          -- item buyouts sent, waiting for the server to confirm
 local lastMoney = nil           -- gold last seen, to spot a buyout going through
 local BID_TIMEOUT = 8           -- seconds before an unconfirmed buyout counts as failed
+local itemInfoQueued = false
 local latePurchase = nil        -- a purchase that timed out mid-buy, in case it still goes through
 local Update                    -- defined further down
 
@@ -65,6 +66,9 @@ local function ItemIcon(itemID)
 end
 
 local function MarketPrice(itemID)
+    -- One market price for the whole addon (Prices.lua); Auctionator only
+    -- if that isn't loaded for some reason
+    if ns.MarketPrice then return ns.MarketPrice(itemID) end
     local api = Auctionator and Auctionator.API and Auctionator.API.v1
     if not (api and api.GetAuctionPriceByItemID) then return nil end
     local ok, price = pcall(api.GetAuctionPriceByItemID, "AHWatch", itemID)
@@ -718,6 +722,13 @@ end
 -- Max price + add
 Label("Max price each:", 14, -200)
 local maxMoney = MoneyInput(22, -216)
+-- How the max compares with the market, updated as you type:
+-- "50% below market (2s)", or "= 1s 60c each" when using a % instead
+local maxVs = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+maxVs:SetPoint("TOPLEFT", f, "TOPLEFT", 108, -200)
+maxVs:SetWidth(238)
+maxVs:SetJustifyH("LEFT")
+maxVs:SetWordWrap(false)
 
 Label("or", 22, -246, "GameFontHighlightSmall")
 local pctBox = CreateFrame("EditBox", "AHWatchPctBox", f, "InputBoxTemplate")
@@ -1114,6 +1125,20 @@ function Update()
     end
     bindBtn:SetText(capturing and "Press a key..." or ("Key: " .. GetKey()))
     ThemeLabel()
+
+    local e = selectedBrowse
+    if not e then
+        maxVs:SetText("")
+    else
+        local pct = tonumber(pctBox:GetText() or "")
+        if pct and pct > 0 then
+            local m = MarketPrice(e.itemID)
+            maxVs:SetText(m and ("|cffffffff= " .. (ns.ShortMoney and ns.ShortMoney(m * pct / 100) or Money(m * pct / 100)) .. " each|r")
+                or "|cff888888no market price yet|r")
+        elseif ns.VsMarket then
+            maxVs:SetText(ns.VsMarket(e.itemID, maxMoney.GetValue()))
+        end
+    end
 end
 ns.Update = Update
 
@@ -1310,6 +1335,7 @@ SlashCmdList["AHWATCH"] = function(msg)
         else
             EnsureDB()
             AHWatchDB.avgMinQty = n
+            if ns.ClearTypicalCache then ns.ClearTypicalCache() end
             print("|cff33ccffAHWatch:|r Average price and bag-arrow trend now need at least "
                 .. n .. " listed on a day before trusting that day's price.")
             if ns.RefreshGraph then ns.RefreshGraph() end
@@ -1538,7 +1564,17 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         lastMoney = now
         if f:IsShown() then Update() end
 
-    elseif e == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" or e == "GET_ITEM_INFO_RECEIVED" then
+    elseif e == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" then
         if f:IsShown() then Update() end
+
+    elseif e == "GET_ITEM_INFO_RECEIVED" then
+        -- These come in bursts (dozens at once): redraw once when it settles
+        if f:IsShown() and not itemInfoQueued then
+            itemInfoQueued = true
+            C_Timer.After(0.2, function()
+                itemInfoQueued = false
+                if f:IsShown() then Update() end
+            end)
+        end
     end
 end)

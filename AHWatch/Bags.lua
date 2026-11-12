@@ -180,12 +180,15 @@ local function DiscoverBagButtons()
 end
 
 local lastDiscoverCount = 0
-local discoverTicker = C_Timer.NewTicker(0.4, function()
+local function ScanBagButtons()
     if not (ns.IsAHOpen and ns.IsAHOpen()) then return end
     local buttons = DiscoverBagButtons()
     lastDiscoverCount = #buttons
     for _, b in ipairs(buttons) do UpdateButton(b) end
-end)
+end
+-- Bag changes update the arrows straight away (events below); this slower
+-- check only catches bags being opened or rearranged
+C_Timer.NewTicker(1, ScanBagButtons)
 local hookedFn = "direct scan (not a hook)"
 
 local function RefreshAll()
@@ -196,11 +199,14 @@ end
 ns.RefreshBagOverlays = RefreshAll
 
 local ev = CreateFrame("Frame")
-for _, e in ipairs({ "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED" }) do
+for _, e in ipairs({ "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED", "BAG_UPDATE_DELAYED" }) do
     pcall(ev.RegisterEvent, ev, e)
 end
 ev:SetScript("OnEvent", function(_, e)
-    if e == "AUCTION_HOUSE_CLOSED" then
+    if e == "AUCTION_HOUSE_SHOW" or e == "BAG_UPDATE_DELAYED" then
+        -- A moment's delay so the bag frames have redrawn first
+        C_Timer.After(0.05, ScanBagButtons)
+    elseif e == "AUCTION_HOUSE_CLOSED" then
         -- Hide every arrow, including ones on bags that are closed right now -
         -- otherwise they'd still be showing the next time those bags open
         for _, o in pairs(overlays) do o.frame:Hide() end

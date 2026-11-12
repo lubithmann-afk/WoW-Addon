@@ -1,15 +1,22 @@
 -- AHWatch ledger
--- A record of everything bought through AH Watch: when, what, how many, and
--- what it cost. Opened with the Ledger button on the main window (or /ahw ledger).
--- Saved with your other AH Watch settings, newest 2000 purchases kept.
+-- What you've bought through AH Watch and what you've earned selling on the
+-- auction house: when, what, how many, and how much. Opened with the Ledger
+-- button on the main window (or /ahw ledger). Newest 2000 entries kept.
+--
+-- Purchases are recorded once the server confirms them. Sales are recorded
+-- when you take the gold out of the "Auction successful" mail (that's when
+-- the money actually reaches you), however you take it - clicking it, or
+-- an "open all" button.
 
 local _, ns = ...
 local main = AHWatchFrame
 local Money = ns.Money
 
 local MAX_ENTRIES = 2000
-local ROWS = 16
+local ROWS = 15
 local ROW_H = 18
+
+local function Short(c) return ns.ShortMoney and ns.ShortMoney(c) or Money(c) end
 
 local function Entries()
     if type(AHWatchDB) ~= "table" then AHWatchDB = {} end
@@ -19,15 +26,47 @@ end
 
 local Refresh
 
--- Called by AHWatch.lua once the server confirms a purchase
-function ns.AddLedger(itemID, name, qty, total)
-    if not itemID then return end
+local function Add(entry)
     local list = Entries()
-    table.insert(list, {
-        t = time(), id = itemID, n = name, q = qty or 1, c = math.floor(total or 0),
-    })
+    table.insert(list, entry)
     while #list > MAX_ENTRIES do table.remove(list, 1) end
     if Refresh then Refresh() end
+end
+
+-- Called by AHWatch.lua once the server confirms a purchase. The market
+-- price at that moment is kept too, to show how good a deal it was.
+function ns.AddLedger(itemID, name, qty, total)
+    if not itemID then return end
+    local m = ns.MarketPrice and ns.MarketPrice(itemID)
+    Add({ t = time(), id = itemID, n = name, q = qty or 1, c = math.floor(total or 0),
+        m = m and math.floor(m) or nil })
+end
+
+------------------------------------------------------------
+-- Sales: read from the auction house's "sold" mail as its gold is taken
+------------------------------------------------------------
+
+local recentMail = {}   -- guards against counting one mail twice
+
+local function RecordSale(index)
+    if type(index) ~= "number" or not GetInboxInvoiceInfo or not GetInboxHeaderInfo then return end
+    local ok, invoiceType, itemName, buyer, bid, buyout, _, cut, _, _, count = pcall(GetInboxInvoiceInfo, index)
+    if not ok or invoiceType ~= "seller" then return end
+    local okH, _, _, _, subject, money, _, daysLeft = pcall(GetInboxHeaderInfo, index)
+    if not okH or not money or money <= 0 then return end
+    local key = tostring(itemName) .. ":" .. money .. ":" .. tostring(daysLeft) .. ":" .. tostring(subject)
+    if recentMail[key] and GetTime() - recentMail[key] < 60 then return end
+    recentMail[key] = GetTime()
+    local id
+    if itemName and C_Item and C_Item.GetItemInfoInstant then
+        local okI, found = pcall(C_Item.GetItemInfoInstant, itemName)
+        if okI and type(found) == "number" then id = found end
+    end
+    Add({ kind = "sale", t = time(), id = id, n = itemName, q = tonumber(count) or 1,
+        c = money, gross = buyout or bid, cut = cut, who = buyer })
+end
+for _, fn in ipairs({ "TakeInboxMoney", "AutoLootMailItem" }) do
+    if _G[fn] then pcall(hooksecurefunc, fn, RecordSale) end
 end
 
 ------------------------------------------------------------
@@ -41,7 +80,7 @@ if not ok or not lf then
     bg:SetAllPoints()
     bg:SetColorTexture(0.05, 0.05, 0.05, 0.92)
 end
-lf:SetSize(360, 452)
+lf:SetSize(360, 470)
 lf:SetPoint("TOPRIGHT", main, "TOPLEFT", -2, 0)
 lf:EnableMouse(true)
 lf:Hide()
@@ -58,31 +97,73 @@ local function Text(font, x, y, width, justify)
 end
 
 -- Totals
-local sumToday = Text("GameFontHighlightSmall", 14, -32, 332)
-local sumWeek  = Text("GameFontHighlightSmall", 14, -47, 332)
-local sumAll   = Text("GameFontHighlightSmall", 14, -62, 332)
+local sumToday = Text("GameFontHighlightSmall", 14, -30, 332)
+local sumWeek  = Text("GameFontHighlightSmall", 14, -45, 332)
+local sumAll   = Text("GameFontHighlightSmall", 14, -60, 332)
+local sumDeal  = Text("GameFontHighlightSmall", 14, -75, 332)
 
--- Filter by name
-Text("GameFontNormalSmall", 14, -84):SetText("Filter:")
+-- Filter by name, and which kind to list
+Text("GameFontNormalSmall", 14, -98):SetText("Filter:")
 local filterBox = CreateFrame("EditBox", nil, lf, "InputBoxTemplate")
-filterBox:SetSize(150, 20)
-filterBox:SetPoint("TOPLEFT", lf, "TOPLEFT", 58, -80)
+filterBox:SetSize(110, 20)
+filterBox:SetPoint("TOPLEFT", lf, "TOPLEFT", 58, -94)
 filterBox:SetAutoFocus(false)
 filterBox:SetScript("OnEscapePressed", function(self) self:SetText(""); self:ClearFocus() end)
 filterBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
-local filterNote = Text("GameFontDisableSmall", 216, -84, 130)
+
+local view = "all"   -- all, buy, sale
+local viewBtns = {}
+for i, v in ipairs({ { "all", "All" }, { "buy", "Bought" }, { "sale", "Sold" } }) do
+    local b = CreateFrame("Button", nil, lf, "UIPanelButtonTemplate")
+    b:SetSize(52, 18)
+    b:SetPoint("TOPRIGHT", lf, "TOPRIGHT", -12 - (3 - i) * 54, -95)
+    b:SetText(v[2])
+    b:SetNormalFontObject(GameFontNormalSmall)
+    b:SetHighlightFontObject(GameFontHighlightSmall)
+    b.view = v[1]
+    viewBtns[i] = b
+end
 
 -- Column headings
-local HY = -106
+local HY = -120
 Text("GameFontNormalSmall", 14, HY, 76):SetText("When")
 Text("GameFontNormalSmall", 92, HY, 140):SetText("Item")
-Text("GameFontNormalSmall", 226, HY, 36, "RIGHT"):SetText("Qty")
-Text("GameFontNormalSmall", 264, HY, 82, "RIGHT"):SetText("Paid")
+Text("GameFontNormalSmall", 214, HY, 36, "RIGHT"):SetText("Qty")
+Text("GameFontNormalSmall", 254, HY, 92, "RIGHT"):SetText("Amount")
 local headLine = lf:CreateTexture(nil, "ARTWORK")
 headLine:SetColorTexture(1, 1, 1, 0.15)
 headLine:SetHeight(1)
 headLine:SetPoint("TOPLEFT", lf, "TOPLEFT", 12, HY - 14)
 headLine:SetPoint("TOPRIGHT", lf, "TOPRIGHT", -12, HY - 14)
+
+local function NameOf(e)
+    if not e.n and e.id then
+        local n = C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(e.id)
+        if n then e.n = n end
+    end
+    return e.n or (e.id and ("Item " .. e.id)) or "?"
+end
+
+local function IconOf(e)
+    local icon
+    if e.id then
+        icon = C_Item and C_Item.GetItemIconByID and C_Item.GetItemIconByID(e.id)
+        if not icon and GetItemIcon then icon = GetItemIcon(e.id) end
+    elseif e.n and C_Item and C_Item.GetItemInfoInstant then
+        local okI, _, _, _, _, found = pcall(C_Item.GetItemInfoInstant, e.n)
+        if okI then icon = found end
+    end
+    return icon or "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+-- "18% under market" / "5% over market" for a purchase, from the price then
+local function DealText(paidEach, marketEach)
+    if not marketEach or marketEach <= 0 then return nil end
+    local pct = (marketEach - paidEach) / marketEach * 100
+    if math.abs(pct) < 0.5 then return "|cffffffffat market|r" end
+    if pct > 0 then return string.format("|cff33dd66%d%% under market|r", math.floor(pct + 0.5)) end
+    return string.format("|cffff6666%d%% over market|r", math.floor(-pct + 0.5))
+end
 
 local rows = {}
 for i = 1, ROWS do
@@ -102,12 +183,12 @@ for i = 1, ROWS do
     b.name:SetJustifyH("LEFT")
     b.name:SetWordWrap(false)
     b.qty = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    b.qty:SetPoint("LEFT", 214, 0)
+    b.qty:SetPoint("LEFT", 202, 0)
     b.qty:SetWidth(36)
     b.qty:SetJustifyH("RIGHT")
-    b.paid = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    b.paid:SetPoint("RIGHT", -2, 0)
-    b.paid:SetJustifyH("RIGHT")
+    b.amount = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    b.amount:SetPoint("RIGHT", -2, 0)
+    b.amount:SetJustifyH("RIGHT")
     if i % 2 == 0 then
         local stripe = b:CreateTexture(nil, "BACKGROUND")
         stripe:SetAllPoints()
@@ -118,19 +199,36 @@ for i = 1, ROWS do
         local e = self.entry
         if not e then return end
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetItemByID(e.id)
+        if e.id then GameTooltip:SetItemByID(e.id) else GameTooltip:SetText(NameOf(e)) end
         GameTooltip:AddLine(" ")
-        GameTooltip:AddDoubleLine("Bought:", date("%a %b %d, %H:%M", e.t), 1, 1, 1, 1, 1, 1)
-        GameTooltip:AddDoubleLine("Amount:", tostring(e.q), 1, 1, 1, 1, 1, 1)
-        GameTooltip:AddDoubleLine("Each:", Money(e.c / math.max(e.q, 1)), 1, 1, 1, 1, 1, 1)
-        GameTooltip:AddDoubleLine("Total:", Money(e.c), 1, 1, 1, 1, 1, 1)
+        local q = math.max(e.q or 1, 1)
+        if e.kind == "sale" then
+            GameTooltip:AddDoubleLine("Sold:", date("%a %b %d, %H:%M", e.t) .. " (gold collected)", 1, 1, 1, 1, 1, 1)
+            GameTooltip:AddDoubleLine("Amount:", tostring(q), 1, 1, 1, 1, 1, 1)
+            if e.who and e.who ~= "" then GameTooltip:AddDoubleLine("Buyer:", e.who, 1, 1, 1, 1, 1, 1) end
+            if e.gross and e.gross > 0 then GameTooltip:AddDoubleLine("Sale price:", Money(e.gross), 1, 1, 1, 1, 1, 1) end
+            if e.cut and e.cut > 0 then GameTooltip:AddDoubleLine("AH cut:", Money(e.cut), 1, 1, 1, 1, 1, 1) end
+            GameTooltip:AddDoubleLine("You got:", Money(e.c), 1, 1, 1, 0.4, 1, 0.4)
+            GameTooltip:AddDoubleLine("Each (after cut):", Money(e.c / q), 1, 1, 1, 1, 1, 1)
+        else
+            GameTooltip:AddDoubleLine("Bought:", date("%a %b %d, %H:%M", e.t), 1, 1, 1, 1, 1, 1)
+            GameTooltip:AddDoubleLine("Amount:", tostring(q), 1, 1, 1, 1, 1, 1)
+            GameTooltip:AddDoubleLine("Each:", Money(e.c / q), 1, 1, 1, 1, 1, 1)
+            GameTooltip:AddDoubleLine("Total:", Money(e.c), 1, 1, 1, 1, 1, 1)
+            if e.m then
+                GameTooltip:AddDoubleLine("Market price then:", Money(e.m) .. " each", 1, 1, 1, 1, 1, 1)
+                local deal = DealText(e.c / q, e.m)
+                if deal then GameTooltip:AddDoubleLine("You paid:", deal, 1, 1, 1, 1, 1, 1) end
+            end
+        end
         GameTooltip:Show()
     end)
     b:SetScript("OnLeave", function() GameTooltip:Hide() end)
     -- Shift-click puts the item link in chat, like anywhere else in the game
     b:SetScript("OnClick", function(self)
-        if self.entry and IsModifiedClick and IsModifiedClick("CHATLINK") then
-            local _, link = GetItemInfo(self.entry.id)
+        local e = self.entry
+        if e and IsModifiedClick and IsModifiedClick("CHATLINK") then
+            local _, link = GetItemInfo(e.id or NameOf(e))
             if link and ChatEdit_InsertLink then ChatEdit_InsertLink(link) end
         end
     end)
@@ -156,24 +254,13 @@ clearBtn:SetHighlightFontObject(GameFontHighlightSmall)
 ------------------------------------------------------------
 
 local offset = 0
-local shown = {}   -- entries matching the filter, newest first
+local shown = {}   -- entries matching the filter and view, newest first
 
-local function NameOf(e)
-    if not e.n then
-        local n = C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(e.id)
-        if n then e.n = n end
-    end
-    return e.n or ("Item " .. e.id)
-end
-
-local function IconOf(id)
-    local icon = C_Item and C_Item.GetItemIconByID and C_Item.GetItemIconByID(id)
-    if not icon and GetItemIcon then icon = GetItemIcon(id) end
-    return icon or "Interface\\Icons\\INV_Misc_QuestionMark"
-end
-
-local function Total(label, sum, count)
-    return label .. Money(sum) .. "  |cffaaaaaa(" .. count .. " purchase" .. (count == 1 and "" or "s") .. ")|r"
+local function Totals(label, spent, nBuy, earned, nSale)
+    local net = earned - spent
+    local netText = (net >= 0) and ("|cff33dd66+" .. Short(net) .. "|r") or ("|cffff6666-" .. Short(-net) .. "|r")
+    return label .. "spent |cffff9999" .. Short(spent) .. "|r (" .. nBuy .. ")   earned |cff99ff99"
+        .. Short(earned) .. "|r (" .. nSale .. ")   net " .. netText
 end
 
 function Refresh()
@@ -187,21 +274,45 @@ function Refresh()
     local todayStart = now - (d.hour * 3600 + d.min * 60 + d.sec)
     local weekStart = todayStart - 6 * 86400
 
-    local tSum, tN, wSum, wN, aSum, aN = 0, 0, 0, 0, 0, 0
+    local T = { day = { 0, 0, 0, 0 }, week = { 0, 0, 0, 0 }, all = { 0, 0, 0, 0 } }
+    local function Count(bucket, e)
+        if e.kind == "sale" then
+            bucket[3], bucket[4] = bucket[3] + e.c, bucket[4] + 1
+        else
+            bucket[1], bucket[2] = bucket[1] + e.c, bucket[2] + 1
+        end
+    end
+    local paidWithMarket, marketValue, dealCount = 0, 0, 0
     shown = {}
     for i = #list, 1, -1 do
         local e = list[i]
         if q == "" or NameOf(e):lower():find(q, 1, true) then
-            table.insert(shown, e)
-            aSum, aN = aSum + e.c, aN + 1
-            if e.t >= weekStart then wSum, wN = wSum + e.c, wN + 1 end
-            if e.t >= todayStart then tSum, tN = tSum + e.c, tN + 1 end
+            Count(T.all, e)
+            if e.t >= weekStart then Count(T.week, e) end
+            if e.t >= todayStart then Count(T.day, e) end
+            if e.kind ~= "sale" and e.m and e.m > 0 then
+                paidWithMarket = paidWithMarket + e.c
+                marketValue = marketValue + e.m * math.max(e.q or 1, 1)
+                dealCount = dealCount + 1
+            end
+            local isSale = (e.kind == "sale")
+            if view == "all" or (view == "sale") == isSale then table.insert(shown, e) end
         end
     end
-    sumToday:SetText(Total("Today:  ", tSum, tN))
-    sumWeek:SetText(Total("Last 7 days:  ", wSum, wN))
-    sumAll:SetText(Total("All saved:  ", aSum, aN))
-    filterNote:SetText(q ~= "" and "(totals for this filter)" or "")
+    sumToday:SetText(Totals("Today:  ", unpack(T.day)))
+    sumWeek:SetText(Totals("7 days:  ", unpack(T.week)))
+    sumAll:SetText(Totals("All:  ", unpack(T.all)))
+    if dealCount > 0 then
+        local deal = DealText(paidWithMarket, marketValue)
+        sumDeal:SetText("Your buys on average: " .. deal .. "  |cffaaaaaa(" .. dealCount .. " with a market price"
+            .. (q ~= "" and ", this filter" or "") .. ")|r")
+    else
+        sumDeal:SetText("|cff888888Your average discount shows here once you've bought something with a market price.|r")
+    end
+
+    for _, b in ipairs(viewBtns) do
+        if b.view == view then b:LockHighlight() else b:UnlockHighlight() end
+    end
 
     offset = math.max(0, math.min(offset, #shown - ROWS))
     for i, b in ipairs(rows) do
@@ -209,10 +320,14 @@ function Refresh()
         if e then
             b.entry = e
             b.when:SetText(date("%b %d %H:%M", e.t))
-            b.icon:SetTexture(IconOf(e.id))
+            b.icon:SetTexture(IconOf(e))
             b.name:SetText(NameOf(e))
-            b.qty:SetText(e.q > 1 and (e.q .. "x") or "1")
-            b.paid:SetText(Money(e.c))
+            b.qty:SetText((e.q or 1) > 1 and (e.q .. "x") or "1")
+            if e.kind == "sale" then
+                b.amount:SetText("|cff99ff99+" .. Short(e.c) .. "|r")
+            else
+                b.amount:SetText("|cffff9999-" .. Short(e.c) .. "|r")
+            end
             b:Show()
         else
             b.entry = nil
@@ -220,9 +335,10 @@ function Refresh()
         end
     end
     if #list == 0 then
-        emptyText:SetText("Nothing bought yet.\nPurchases made with AH Watch show up here.")
+        emptyText:SetText("Nothing here yet.\nPurchases made with AH Watch, and gold you collect from auction "
+            .. "house sales in your mailbox, show up here.")
     elseif #shown == 0 then
-        emptyText:SetText("No purchases match that filter.")
+        emptyText:SetText("Nothing matches.")
     else
         emptyText:SetText("")
     end
@@ -231,6 +347,9 @@ function Refresh()
     clearBtn:SetEnabled(#list > 0)
 end
 
+for _, b in ipairs(viewBtns) do
+    b:SetScript("OnClick", function(self) view = self.view; offset = 0; Refresh() end)
+end
 lf:EnableMouseWheel(true)
 lf:SetScript("OnMouseWheel", function(_, delta)
     local step = IsShiftKeyDown() and ROWS or 3
@@ -241,7 +360,7 @@ lf:SetScript("OnShow", function() offset = 0; Refresh() end)
 filterBox:SetScript("OnTextChanged", function() offset = 0; Refresh() end)
 
 StaticPopupDialogs["AHWATCH_CLEAR_LEDGER"] = {
-    text = "Clear AH Watch's whole purchase history? This can't be undone.",
+    text = "Clear AH Watch's whole ledger (purchases and sales)? This can't be undone.",
     button1 = YES or "Yes",
     button2 = NO or "No",
     OnAccept = function()

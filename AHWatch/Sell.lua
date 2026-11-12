@@ -141,21 +141,11 @@ local function Analyze(e)
     local a = { vendor = VendorPrice(e.itemID) }
     local hist = ns.GetPriceRecord and ns.GetPriceRecord(e.itemID)
 
-    -- Typical price: the same undercut-resistant average the tooltip and
-    -- Flip opportunities use (middle of each busy day's typical price).
-    -- Thin history falls back to the middle of whatever days there are.
-    local typical, days = ns.GetTypicalPrice and ns.GetTypicalPrice(e.itemID)
-    if typical then
-        a.typical, a.days = math.floor(typical), days
-    elseif hist and hist.d and #hist.d > 0 then
-        local avgs = {}
-        for _, d in ipairs(hist.d) do
-            if d[4] and d[4] > 0 then avgs[#avgs + 1] = d[4] end
-        end
-        if #avgs > 0 then
-            table.sort(avgs)
-            a.typical, a.days = math.floor(avgs[math.ceil(#avgs / 2)]), #avgs
-        end
+    -- Market price: the one the whole addon uses (saved history once it has
+    -- 2+ reliable days, Auctionator before that)
+    if ns.MarketPrice then
+        local m, source, days = ns.MarketPrice(e.itemID)
+        if m then a.typical, a.source, a.days = m, source, days end
     end
 
     -- Cheapest listing right now: a fresh "Check price" beats saved data
@@ -316,6 +306,9 @@ local advice = Text(panel, "GameFontNormalSmall", 8, DY - 80, 330)
 advice:SetSpacing(2)
 
 Text(panel, "GameFontNormalSmall", 8, DY - 118):SetText("Price each:")
+-- How your price compares with the market, updated as you type
+local sellVs = Text(panel, "GameFontHighlightSmall", 74, DY - 118, 150)
+sellVs:SetWordWrap(false)
 local modeBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
 modeBtn:SetSize(100, 18)
 modeBtn:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -6, DY - 118)
@@ -423,6 +416,8 @@ local qsSelectedText = Text(qsPanel, "GameFontNormal", 8, QS_DY, 330)
 qsSelectedText:SetText("Selected: |cffaaaaaanothing yet|r")
 
 Text(qsPanel, "GameFontNormalSmall", 8, QS_DY - 28):SetText("Price each:")
+local qsVs = Text(qsPanel, "GameFontHighlightSmall", 74, QS_DY - 28, 260)
+qsVs:SetWordWrap(false)
 local qsPriceMoney = ns.MoneyInput(16, QS_DY - 44, nil, qsPanel)
 
 Text(qsPanel, "GameFontNormalSmall", 8, QS_DY - 76):SetText("Amount per press:")
@@ -553,6 +548,7 @@ local function RefreshDetail()
     local e = Selected()
     for i = 1, 4 do dLines[i]:SetText("") end
     if not e then
+        sellVs:SetText("")
         dName:SetText("Click an item above to see its prices.")
         advice:SetText("")
         depositText:SetText("")
@@ -565,7 +561,8 @@ local function RefreshDetail()
     checkBtn:SetEnabled(ns.IsAHOpen())
     dName:SetText((e.link or e.name) .. "  x" .. e.count)
 
-    dLines[1]:SetText("Average price (" .. (a.days or 0) .. " days saved): " ..
+    local basis = (a.source == "auctionator") and "from Auctionator" or ((a.days or 0) .. " days saved")
+    dLines[1]:SetText("Market price (" .. basis .. "): " ..
         (a.typical and Money(a.typical) or "|cff888888no history yet - run a full scan|r"))
     if a.low then
         dLines[2]:SetText("Cheapest listing: " .. Money(a.low) .. "  |cffaaaaaa(" .. (a.listed or 0) .. " listed, "
@@ -631,6 +628,7 @@ local function RefreshDetail()
         postBtn:Enable()
     else
         local price = priceMoney.GetValue()
+        sellVs:SetText(ns.VsMarket and ns.VsMarket(e.itemID, price) or "")
         postBtn:SetText(price > 0 and qty > 0 and ("Post " .. qty .. " for " .. Money(price) .. " each") or "Set a price and quantity")
         postBtn:SetEnabled(ns.IsAHOpen() and price > 0 and qty > 0)
     end
@@ -825,6 +823,7 @@ function RefreshQS()
     end
 
     if not qsItemID then
+        qsVs:SetText("")
         qsSelectedText:SetText("Selected: |cffaaaaaanothing yet - click an item above|r")
         qsStatus:SetText("")
         qsPostedLabel:SetText("")
@@ -836,6 +835,7 @@ function RefreshQS()
     qsSelectedText:SetText("Selected: " .. (qsItemName or "?") .. "  |cffaaaaaa(" .. haveCount .. " in bags)|r")
 
     local price, qty = qsPriceMoney.GetValue(), QSQty()
+    qsVs:SetText(ns.VsMarket and ns.VsMarket(qsItemID, price) or "")
     local cooldownWait = 0
     if AHWatchDB and AHWatchDB.qsCooldownEnabled then
         cooldownWait = (AHWatchDB.qsCooldownSec or 3) - (GetTime() - lastQSPost)
