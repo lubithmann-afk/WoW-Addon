@@ -27,6 +27,7 @@ local searchAuto = false        -- the search in progress was started by the add
 local pendingBids = {}          -- item buyouts sent, waiting for the server to confirm
 local lastMoney = nil           -- gold last seen, to spot a buyout going through
 local BID_TIMEOUT = 8           -- seconds before an unconfirmed buyout counts as failed
+local latePurchase = nil        -- a purchase that timed out mid-buy, in case it still goes through
 local Update                    -- defined further down
 
 ------------------------------------------------------------
@@ -182,16 +183,40 @@ local function SetState(s)
     if Update then Update() end
 end
 
+-- A step got stuck: skip ahead to the next watched item, so the next press
+-- does something useful instead of retrying the same stuck one. (With
+-- "Cycle list" unchecked it stays on this item, as that setting asks.)
+local function MoveOn()
+    local list = AHWatchDB and AHWatchDB.watch
+    if not list or #list == 0 then return end
+    if current > #list then current = 1 end
+    local stuck = list[current]
+    runtime[stuck.itemID] = nil
+    local name = stuck.name or "that item"
+    if #list < 2 or AHWatchDB.cycleList == false then
+        Msg(name .. " got stuck - press again to retry.")
+        return
+    end
+    current = current % #list + 1
+    Msg(name .. " got stuck - moved on to " .. (list[current].name or "the next item") .. ".")
+end
+
 -- Resets a step that never got an answer from the server
 local function Timeout(expected, seconds)
     local token = {}
     purchaseToken = token
     C_Timer.After(seconds, function()
         if state == expected and purchaseToken == token then
+            -- Steps the addon started by itself just quietly stop (the next
+            -- press sends them for real); waiting on your confirm isn't stuck
+            local auto = (expected == "searching" and searchAuto) or (purchase and purchase.auto)
             if expected == "pricing" or expected == "confirm" then
                 pcall(C_AuctionHouse.CancelCommoditiesPurchase)
             end
+            if expected == "buying" then latePurchase = purchase end
             purchase = nil
+            searchAuto = false
+            if expected ~= "confirm" and not auto then MoveOn() end
             SetState("idle")
         end
     end)
@@ -210,7 +235,7 @@ local function Search(w, auto)
         SetState("idle")
         return
     end
-    Timeout("searching", 8)
+    Timeout("searching", 6)
 end
 
 -- A buyout the server never confirmed: take it back off the spent/bought counts
@@ -244,7 +269,7 @@ local function Buy(w, plan, auto)
             SetState("idle")
             return
         end
-        Timeout("pricing", 6)
+        Timeout("pricing", 5)
     else
         local ok, err = pcall(C_AuctionHouse.PlaceBid, plan.auctionID, plan.price)
         if not ok then
@@ -318,7 +343,7 @@ local function BuyGo()
         if not Ready() then return end
         purchase.auto = false
         local ok = pcall(C_AuctionHouse.StartCommoditiesPurchase, purchase.itemID, purchase.qty)
-        if ok then Timeout("pricing", 6) else purchase = nil; SetState("idle") end
+        if ok then Timeout("pricing", 5) else purchase = nil; SetState("idle") end
         return
     end
     if state == "searching" and searchAuto then
@@ -1434,6 +1459,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         -- Safety check: the real price must still be within your max, your gold and your limit
         if total and total <= purchase.qty * purchase.max and total <= Budget() then
             purchase.total = total
+            purchase.auto = false   -- the automatic part is done; from here it's a normal purchase
             SetState("confirm")
             Timeout("confirm", 15)
         else
@@ -1451,14 +1477,21 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         SetState("idle")
 
     elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
+        -- (latePurchase: it timed out and we moved on, but it went through after all)
+        local p, late = purchase or latePurchase, (purchase == nil)
+        latePurchase = nil
         local w
-        if purchase then
-            spent = spent + (purchase.total or 0)
-            w = FindWatch(purchase.itemID)
-            if w then w.bought = (w.bought or 0) + purchase.qty end
-            if ns.AddLedger then ns.AddLedger(purchase.itemID, purchase.name, purchase.qty, purchase.total or 0) end
-            Msg("bought " .. purchase.qty .. "x " .. (purchase.name or "item") .. " for " .. Money(purchase.total or 0) .. ".")
-            runtime[purchase.itemID] = nil
+        if p then
+            spent = spent + (p.total or 0)
+            w = FindWatch(p.itemID)
+            if w then w.bought = (w.bought or 0) + p.qty end
+            if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.total or 0) end
+            Msg("bought " .. p.qty .. "x " .. (p.name or "item") .. " for " .. Money(p.total or 0) .. ".")
+            runtime[p.itemID] = nil
+        end
+        if late then
+            if Update then Update() end
+            return
         end
         purchase = nil
         SetState("idle")
@@ -1469,6 +1502,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         end
 
     elseif e == "COMMODITY_PURCHASE_FAILED" then
+        latePurchase = nil
         if purchase then runtime[purchase.itemID] = nil end
         Msg("purchase failed - press again to refresh.")
         purchase = nil
