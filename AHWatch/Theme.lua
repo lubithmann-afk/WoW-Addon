@@ -246,8 +246,8 @@ local function SkinWindow(fr)
         if wantArt then
             if st.artLoadedKey ~= C.art then
                 local path = "Interface\\AddOns\\AHWatch\\art\\bg_" .. st.artSlot .. "_" .. C.art .. ".tga"
-                local ok = pcall(st.art.SetTexture, st.art, path)
-                st.artOk = ok and st.art:GetTexture() and true or false
+                local ok, loaded = pcall(st.art.SetTexture, st.art, path)
+                st.artOk = ok and loaded ~= false and st.art:GetTexture() and true or false
                 st.artLoadedKey = C.art
                 if not st.artOk and not artWarned[C.art] then
                     artWarned[C.art] = true
@@ -386,15 +386,18 @@ local function SkinEditBox(e)
         st.bg = holder:CreateTexture(nil, "BACKGROUND", nil, 0)
         st.bg:SetPoint("TOPLEFT", CAP_W - 2, 0)
         st.bg:SetPoint("BOTTOMRIGHT", -(CAP_W - 2), 0)
-        local capOk = true
+        local function Load(tex, path)
+            local ok, loaded = pcall(tex.SetTexture, tex, path)
+            return ok and loaded ~= false
+        end
+        local CAP = "Interface\\AddOns\\AHWatch\\art\\input_cap.tga"
         st.capL = holder:CreateTexture(nil, "BACKGROUND", nil, 1)
         st.capL:SetSize(CAP_W, 22)
         st.capL:SetPoint("LEFT", 0, 0)
-        capOk = capOk and pcall(st.capL.SetTexture, st.capL, "Interface\\AddOns\\AHWatch\\art\\input_cap.tga")
         st.capR = holder:CreateTexture(nil, "BACKGROUND", nil, 1)
         st.capR:SetSize(CAP_W, 22)
         st.capR:SetPoint("RIGHT", 0, 0)
-        capOk = capOk and pcall(st.capR.SetTexture, st.capR, "Interface\\AddOns\\AHWatch\\art\\input_cap.tga")
+        local capOk = Load(st.capL, CAP) and Load(st.capR, CAP)
         if capOk then st.capR:SetTexCoord(1, 0, 0, 1) end
         st.capOk = capOk
         if not capOk then
@@ -510,7 +513,7 @@ function ns.ApplyTheme(name)
     mode = PALETTES[name] and name or "classic"
     C = PALETTES[mode] or PALETTES.auction
     ns.theme = mode
-    for _, fr in ipairs({ _G.AHWatchFrame, _G.AHWatchGraphFrame }) do
+    for _, fr in ipairs({ _G.AHWatchFrame, _G.AHWatchGraphFrame, _G.AHWatchLedgerFrame }) do
         if fr then
             SkinWindow(fr)
             Walk(fr)

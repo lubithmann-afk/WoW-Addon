@@ -62,18 +62,22 @@ local function SplitChunks(str)
     return chunks
 end
 
+local function EncodeOne(itemID, it)
+    local days = {}
+    for _, d in ipairs(it.d or {}) do
+        days[#days + 1] = table.concat(d, ",")
+    end
+    return itemID .. " " ..
+        table.concat(it.l or { 0, 0, 0, 0 }, ",") .. " " ..
+        table.concat(it.lo or { 0, 0 }, ",") .. " " ..
+        table.concat(it.hi or { 0, 0 }, ",") .. " " ..
+        table.concat(days, ";")
+end
+
 local function EncodeItems(items)
     local parts = {}
     for itemID, it in pairs(items) do
-        local days = {}
-        for _, d in ipairs(it.d or {}) do
-            table.insert(days, table.concat(d, ","))
-        end
-        table.insert(parts, itemID .. " " ..
-            table.concat(it.l or { 0, 0, 0, 0 }, ",") .. " " ..
-            table.concat(it.lo or { 0, 0 }, ",") .. " " ..
-            table.concat(it.hi or { 0, 0 }, ",") .. " " ..
-            table.concat(days, ";"))
+        parts[#parts + 1] = EncodeOne(itemID, it)
     end
     return table.concat(parts, "\n")
 end
@@ -100,17 +104,21 @@ local function DecodeItems(str)
     return items
 end
 
--- Writes the working copy back into the saved chunks. Cheap to call after a
--- batch of changes; avoid calling it once per item during a full scan.
+-- Writes the working copy back into the saved chunks. This re-encodes the
+-- whole history, so it only runs when it has to: on logout/reload (the only
+-- time the game writes saved data to disk anyway) and after trimming.
+-- It used to run after every single search, which made each press hitch
+-- once the history got big.
+local sizeAt = 0
 local function SyncItemsString()
-    AHWatchItemsData = SplitChunks(EncodeItems(runtimeItems))
+    local str = EncodeItems(runtimeItems)
+    AHWatchItemsData = SplitChunks(str)
     itemsDirty = false
-    sizeCache = nil
+    sizeCache, sizeAt = 300 + #str, GetTime()
 end
 
 local function MarkDirty()
     itemsDirty = true
-    sizeCache = nil
 end
 
 local function LimitMB() return (AHWatchDB and AHWatchDB.limitMB) or DEFAULT_LIMIT_MB end
@@ -276,24 +284,27 @@ function ns.RecordRows(itemID, rows, isCommodity)
             if cum >= half then break end
         end
         Record(itemID, low, typical, qty)
-        SyncItemsString()
-        if ns.RefreshGraph then ns.RefreshGraph() end
-        if ns.RefreshFlips then ns.RefreshFlips() end
+        if ns.SchedulePriceRefresh then ns.SchedulePriceRefresh() end
     end
 end
 
--- Actual size of the saved chunks, in bytes
-local function EstimateBytes()
-    if sizeCache and not itemsDirty then return sizeCache end
-    sizeCache = 300 + #EncodeItems(runtimeItems)
+-- Size of the saved chunks, in bytes. Measuring means encoding everything,
+-- so while prices are changing it's re-measured at most every 30 seconds
+-- (the panel's footer asks every second); force gets an exact number.
+local function EstimateBytes(force)
+    if sizeCache and not force and (not itemsDirty or GetTime() - sizeAt < 30) then return sizeCache end
+    sizeCache, sizeAt = 300 + #EncodeItems(runtimeItems), GetTime()
     return sizeCache
 end
 
 -- Keeps the file under the limit: drops the items seen longest ago first,
 -- and never drops anything on your watch list.
+-- (Measures once, then subtracts each dropped item's own size, instead of
+-- re-measuring everything after every single item.)
 local function Prune()
     local limit = LimitMB() * 1024 * 1024
-    if EstimateBytes() <= limit then return 0 end
+    local size = EstimateBytes(true)
+    if size <= limit then return 0 end
     local candidates = {}
     for id, it in pairs(runtimeItems) do
         if not IsWatched(id) then table.insert(candidates, { id = id, t = (it.l and it.l[1]) or 0 }) end
@@ -301,12 +312,15 @@ local function Prune()
     table.sort(candidates, function(a, b) return a.t < b.t end)
     local removed = 0
     for _, c in ipairs(candidates) do
+        size = size - (#EncodeOne(c.id, runtimeItems[c.id]) + 1)
         runtimeItems[c.id] = nil
         removed = removed + 1
-        MarkDirty()
-        if EstimateBytes() <= limit then break end
+        if size <= limit then break end
     end
-    if removed > 0 then SyncItemsString() end
+    if removed > 0 then
+        MarkDirty()
+        SyncItemsString()
+    end
     return removed
 end
 
@@ -335,8 +349,26 @@ local function ProcessReplicate()
     local saveStart = GetTime()
     local agg, idx, listings = {}, 0, 0
     local clock = debugprofilestop
+    local toRecord, recIdx = nil, 0   -- second pass: saving each item, also spread over frames
+    local scanTime = time()
     local function Step()
         local started = clock and clock()
+        if toRecord then
+            local stopAt = clock and #toRecord or math.min(recIdx + FALLBACK_CHUNK, #toRecord)
+            while recIdx < stopAt do
+                recIdx = recIdx + 1
+                local itemID = toRecord[recIdx]
+                local a = agg[itemID]
+                Record(itemID, a.low, a.sum / a.qty, a.qty, scanTime)
+                if clock and (recIdx % 200 == 0) and clock() - started > FRAME_BUDGET_MS then break end
+            end
+            progress = 90 + math.floor(recIdx / math.max(#toRecord, 1) * 10)
+            if recIdx < #toRecord then
+                C_Timer.After(0, SafeStep)
+                return
+            end
+            return "done"
+        end
         local stop = clock and n or math.min(idx + FALLBACK_CHUNK, n)
         for i = idx, stop - 1 do
             local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, _, itemID = C_AuctionHouse.GetReplicateItemInfo(i)
@@ -356,16 +388,17 @@ local function ProcessReplicate()
             -- Stop for this frame once the time budget is used up
             if clock and (i % 200 == 0) and clock() - started > FRAME_BUDGET_MS then break end
         end
-        progress = math.floor(idx / n * 100)
+        progress = math.floor(idx / n * 90)
         if idx < n then
             C_Timer.After(0, SafeStep)
             return
         end
-        local t, count = time(), 0
-        for itemID, a in pairs(agg) do
-            Record(itemID, a.low, a.sum / a.qty, a.qty, t)
-            count = count + 1
-        end
+        toRecord = {}
+        for itemID in pairs(agg) do toRecord[#toRecord + 1] = itemID end
+        C_Timer.After(0, SafeStep)
+    end
+    local function Finish()
+        local t, count = scanTime, #toRecord
         local db = EnsurePrices()
         db.lastScanInfo = { t = t, items = count, listings = listings, raw = n }
         if waited then
@@ -374,7 +407,7 @@ local function ProcessReplicate()
             while #db.scanTimes > 3 do table.remove(db.scanTimes, 1) end
         end
         local removed = Prune()
-        SyncItemsString()
+        if removed == 0 then MarkDirty() end   -- written to disk on logout/reload
         scanning = false
         phase = "idle"
         Msg(string.format("full scan done: saved %d items (%d listings). Saved data: %.1f MB of %g MB%s.",
@@ -387,6 +420,7 @@ local function ProcessReplicate()
     -- staying stuck on "scanning" (which would block every later scan)
     function SafeStep()
         local ok, err = pcall(Step)
+        if ok and err == "done" then ok, err = pcall(Finish) end
         if not ok then
             scanning = false
             phase = "idle"
@@ -434,7 +468,44 @@ g:SetSize(340, 515)
 g:SetPoint("TOPLEFT", main, "TOPRIGHT", 2, 0)
 if ns.AddScaleGrip then ns.AddScaleGrip(g) end
 if g.TitleText then g.TitleText:SetText("Price history") end
-if g.CloseButton then g.CloseButton:Hide() end
+-- The panel can be tucked away: its X hides it, and a small "Prices" button
+-- on the main window's title bar brings it back. Remembered between sessions.
+local showPricesBtn = CreateFrame("Button", nil, main, "UIPanelButtonTemplate")
+showPricesBtn:SetSize(64, 18)
+showPricesBtn:SetPoint("TOPLEFT", main, "TOPLEFT", 6, -3)
+showPricesBtn:SetText("Prices >")
+showPricesBtn:SetNormalFontObject(GameFontNormalSmall)
+showPricesBtn:SetHighlightFontObject(GameFontHighlightSmall)
+showPricesBtn:SetFrameLevel(main:GetFrameLevel() + 60)
+showPricesBtn:Hide()
+
+local function SetGraphShown(show)
+    if type(AHWatchDB) == "table" then AHWatchDB.graphHidden = (not show) or nil end
+    g:SetShown(show)
+    showPricesBtn:SetShown(not show)
+end
+ns.SetGraphShown = SetGraphShown
+showPricesBtn:SetScript("OnClick", function() SetGraphShown(true) end)
+showPricesBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Show the price history panel")
+    GameTooltip:Show()
+end)
+showPricesBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+local hideBtn = g.CloseButton
+if not hideBtn then
+    hideBtn = CreateFrame("Button", nil, g, "UIPanelCloseButton")
+    hideBtn:SetPoint("TOPRIGHT", -2, -2)
+end
+hideBtn:SetScript("OnClick", function() SetGraphShown(false) end)
+hideBtn:HookScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Hide price history")
+    GameTooltip:AddLine("Bring it back with the Prices button at the top left of AH Watch.", 1, 1, 1, true)
+    GameTooltip:Show()
+end)
+hideBtn:HookScript("OnLeave", function() GameTooltip:Hide() end)
 if not g.TitleText then
     local bg = g:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
@@ -961,6 +1032,22 @@ end
 
 g:SetScript("OnShow", function() ns.RefreshGraph(); ns.RefreshFlips() end)
 
+-- New prices arrive with every search. Redrawing the graph and re-ranking
+-- every saved item for Flip opportunities is the slow part, so it's done
+-- once things settle (not after each result), and only while it's on screen.
+local priceRefreshQueued = false
+function ns.SchedulePriceRefresh()
+    if priceRefreshQueued then return end
+    priceRefreshQueued = true
+    C_Timer.After(0.3, function()
+        priceRefreshQueued = false
+        if g:IsVisible() then
+            ns.RefreshGraph()
+            ns.RefreshFlips()
+        end
+    end)
+end
+
 ------------------------------------------------------------
 -- Tooltips
 ------------------------------------------------------------
@@ -1027,6 +1114,7 @@ pcall(ev.RegisterEvent, ev, "PLAYER_LOGOUT")   -- fires on /reload, logout and e
 ev:SetScript("OnEvent", function(_, e, a1)
     if e == "ADDON_LOADED" and a1 == "AHWatch" then
         EnsurePrices()
+        SetGraphShown(not (type(AHWatchDB) == "table" and AHWatchDB.graphHidden))
         -- Load the price history, or migrate it from an older format if
         -- that's what's on disk from before this fix (one long string, or
         -- the original oversized table).

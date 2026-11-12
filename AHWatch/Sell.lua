@@ -4,8 +4,8 @@
 -- quickly without giving money away, and lets you post from the same screen.
 --
 -- Note: the auction house never shows what items actually SOLD for, only what
--- they're listed at. "Average" here is the average cheapest listing from the
--- price history this addon has saved.
+-- they're listed at. "Average" here is the same typical listed price the
+-- tooltip shows, from the price history this addon has saved.
 
 local _, ns = ...
 local f = AHWatchFrame
@@ -141,12 +141,21 @@ local function Analyze(e)
     local a = { vendor = VendorPrice(e.itemID) }
     local hist = ns.GetPriceRecord and ns.GetPriceRecord(e.itemID)
 
-    -- Typical price: average of each day's cheapest listing
-    if hist and hist.d and #hist.d > 0 then
-        local sum = 0
-        for _, d in ipairs(hist.d) do sum = sum + d[2] end
-        a.typical = math.floor(sum / #hist.d)
-        a.days = #hist.d
+    -- Typical price: the same undercut-resistant average the tooltip and
+    -- Flip opportunities use (middle of each busy day's typical price).
+    -- Thin history falls back to the middle of whatever days there are.
+    local typical, days = ns.GetTypicalPrice and ns.GetTypicalPrice(e.itemID)
+    if typical then
+        a.typical, a.days = math.floor(typical), days
+    elseif hist and hist.d and #hist.d > 0 then
+        local avgs = {}
+        for _, d in ipairs(hist.d) do
+            if d[4] and d[4] > 0 then avgs[#avgs + 1] = d[4] end
+        end
+        if #avgs > 0 then
+            table.sort(avgs)
+            a.typical, a.days = math.floor(avgs[math.ceil(#avgs / 2)]), #avgs
+        end
     end
 
     -- Cheapest listing right now: a fresh "Check price" beats saved data

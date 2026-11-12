@@ -3,11 +3,9 @@
 -- arrow with a percentage on crafting materials in your bags, based on how
 -- their saved price has moved day over day. Crafting materials only, for now.
 --
--- This hooks the same function Blizzard's own bag UI uses to draw each item
--- button, so it works regardless of how this client names its bag frames -
--- but it's still touching another addon's UI internals, which is the kind
--- of thing that can behave differently on a modified client. If arrows don't
--- show up, /ahw bagtest reports exactly what it found.
+-- It finds the bag item buttons directly a couple of times a second while the
+-- auction house is open, which works however this client builds its bags.
+-- If arrows don't show up, /ahwbagtest reports exactly what it found.
 
 local _, ns = ...
 
@@ -83,13 +81,10 @@ local function GetBagSlot(button)
     return bag, slot
 end
 
-local sawAnyButton = false
-
 local testOverrides = {}   -- itemID -> fake percent, set via /ahwtestarrow for visual testing
 
 local function UpdateButton(button)
     if not button or not button.GetParent then return end
-    sawAnyButton = true
     local o = GetOverlay(button)
     if not (ns.IsAHOpen and ns.IsAHOpen()) then
         o.frame:Hide()
@@ -206,7 +201,9 @@ for _, e in ipairs({ "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED" }) do
 end
 ev:SetScript("OnEvent", function(_, e)
     if e == "AUCTION_HOUSE_CLOSED" then
-        RefreshAll()   -- hides any overlays that were showing
+        -- Hide every arrow, including ones on bags that are closed right now -
+        -- otherwise they'd still be showing the next time those bags open
+        for _, o in pairs(overlays) do o.frame:Hide() end
     end
 end)
 

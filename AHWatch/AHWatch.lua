@@ -23,6 +23,10 @@ local spent = 0                 -- copper spent this session
 local ahOpen = false
 local purchaseToken = nil       -- identifies the step a timeout belongs to
 local browsePending = false     -- true while our own name search is waiting for results
+local searchAuto = false        -- the search in progress was started by the addon, not a press
+local pendingBids = {}          -- item buyouts sent, waiting for the server to confirm
+local lastMoney = nil           -- gold last seen, to spot a buyout going through
+local BID_TIMEOUT = 8           -- seconds before an unconfirmed buyout counts as failed
 local Update                    -- defined further down
 
 ------------------------------------------------------------
@@ -193,26 +197,49 @@ local function Timeout(expected, seconds)
     end)
 end
 
-local function Search(w)
+-- auto = started by the addon itself (not a press). If the game ignores an
+-- automatic request, the next press simply sends it again for real.
+local function Search(w, auto)
     local key = w.itemKey or C_AuctionHouse.MakeItemKey(w.itemID)
     runtime[w.itemID] = nil
+    searchAuto = auto and true or false
     SetState("searching")
     local ok, err = pcall(C_AuctionHouse.SendSearchQuery, key, { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
     if not ok then
-        Msg("search failed: " .. tostring(err))
+        if not auto then Msg("search failed: " .. tostring(err)) end
         SetState("idle")
         return
     end
     Timeout("searching", 8)
 end
 
-local function Buy(w, plan)
+-- A buyout the server never confirmed: take it back off the spent/bought counts
+local function FailBid(p)
+    for i, q in ipairs(pendingBids) do
+        if q == p then table.remove(pendingBids, i) break end
+    end
+    spent = math.max(0, spent - p.price)
+    if p.w then p.w.bought = math.max(0, (p.w.bought or 0) - p.qty) end
+    if (p.w and p.w.bought) == 0 then p.w.bought = nil end
+    Msg((p.name or "that item") .. " didn't go through (someone else may have bought it first).")
+    if Update then Update() end
+end
+
+local function ConfirmBid(i)
+    local p = table.remove(pendingBids, i)
+    if not p then return end
+    if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.price) end
+    local qtyText = p.qty > 1 and (p.qty .. "x ") or ""
+    Msg("bought " .. qtyText .. (p.name or "item") .. " for " .. Money(p.price) .. ".")
+end
+
+local function Buy(w, plan, auto)
     if plan.kind == "commodity" then
-        purchase = { itemID = w.itemID, qty = plan.qty, max = MaxPriceFor(w), name = w.name, expected = plan.total }
+        purchase = { itemID = w.itemID, qty = plan.qty, max = MaxPriceFor(w), name = w.name, expected = plan.total, auto = auto }
         SetState("pricing")
         local ok, err = pcall(C_AuctionHouse.StartCommoditiesPurchase, w.itemID, plan.qty)
         if not ok then
-            Msg("couldn't start the purchase: " .. tostring(err))
+            if not auto then Msg("couldn't start the purchase: " .. tostring(err)) end
             purchase = nil
             SetState("idle")
             return
@@ -224,10 +251,18 @@ local function Buy(w, plan)
             Msg("couldn't buy: " .. tostring(err))
             return
         end
+        -- Counted right away so the spend limit holds while you keep pressing;
+        -- taken back off if the server doesn't confirm it (FailBid)
+        local qty = plan.row.quantity or 1
         spent = spent + plan.price
-        w.bought = (w.bought or 0) + (plan.row.quantity or 1)
-        local qtyText = (plan.row.quantity or 1) > 1 and (plan.row.quantity .. "x ") or ""
-        Msg("bought " .. qtyText .. (w.name or "item") .. " for " .. Money(plan.price) .. ".")
+        w.bought = (w.bought or 0) + qty
+        local p = { auctionID = plan.auctionID, price = plan.price, qty = qty, itemID = w.itemID, name = w.name, w = w }
+        table.insert(pendingBids, p)
+        C_Timer.After(BID_TIMEOUT, function()
+            for _, q in ipairs(pendingBids) do
+                if q == p then FailBid(p) return end
+            end
+        end)
         -- Take it off the local list so the next press buys the next one
         local rows = runtime[w.itemID] and runtime[w.itemID].rows
         if rows then
@@ -258,6 +293,19 @@ local function CancelBuy()
     SetState("idle")
 end
 
+local function CurrentTab() return (AHWatchDB and AHWatchDB.tab) or "buy" end
+ns.CurrentTab = CurrentTab
+
+-- Right after fresh results for a commodity, ask for its price straight away
+-- so the next press can confirm - one press per batch instead of two.
+-- (Only gets a price quote; nothing is bought without a press.)
+local function AutoQuote(w)
+    if not ahOpen or state ~= "idle" or CurrentTab() ~= "buy" then return end
+    if AHWatchDB.watch[current] ~= w or not w.isCommodity or not Ready() then return end
+    local plan = Plan(w)
+    if plan and plan.kind == "commodity" then Buy(w, plan, true) end
+end
+
 -- The one button on the Buy tab: refresh, buy, confirm, or move to the next item
 local function BuyGo()
     EnsureDB()
@@ -265,6 +313,20 @@ local function BuyGo()
     if not ahOpen then Msg("open the auction house first.") return end
     if #list == 0 then Msg("add an item to your watch list first.") return end
     if state == "confirm" then ConfirmBuy() return end
+    -- An automatic step the game may have ignored: this press sends it for real
+    if state == "pricing" and purchase and purchase.auto then
+        if not Ready() then return end
+        purchase.auto = false
+        local ok = pcall(C_AuctionHouse.StartCommoditiesPurchase, purchase.itemID, purchase.qty)
+        if ok then Timeout("pricing", 6) else purchase = nil; SetState("idle") end
+        return
+    end
+    if state == "searching" and searchAuto then
+        if not Ready() then return end
+        local w = list[current]
+        if w then Search(w) end
+        return
+    end
     if state ~= "idle" then return end
     if not Ready() then return end
 
@@ -291,15 +353,18 @@ local function BuyGo()
     Search(list[current])
 end
 
-local function CurrentTab() return (AHWatchDB and AHWatchDB.tab) or "buy" end
-ns.CurrentTab = CurrentTab
-
 -- The single Go button/keybind is shared across tabs - Buy has its
 -- watch-list logic above, Quick Sell (Sell.lua) has its own repeated-press
--- post logic. Route to whichever tab is actually showing.
+-- post logic. On the Sell tab the button is hidden, so the key just brings
+-- you back to Buy rather than buying anything out of sight.
 local function Go()
-    if CurrentTab() == "quicksell" and ns.QuickSellGo then
+    local tab = CurrentTab()
+    if tab == "quicksell" and ns.QuickSellGo then
         ns.QuickSellGo()
+        return
+    end
+    if tab == "sell" then
+        if ns.SetTab then ns.SetTab("buy") end
         return
     end
     BuyGo()
@@ -354,8 +419,13 @@ end
 -- dragging it resizes THIS addon's own windows (both of them together),
 -- separate from the game's own UI scale option.
 function ns.AddScaleGrip(frame)
-    table.insert(scaledFrames, frame)
-    frame:SetScale(CurrentScale())
+    -- Windows attached to the main one already inherit its scale; scaling
+    -- them too would apply it twice
+    local parent = frame:GetParent()
+    if not parent or parent == UIParent then
+        table.insert(scaledFrames, frame)
+        frame:SetScale(CurrentScale())
+    end
 
     local grip = CreateFrame("Button", nil, frame)
     grip:SetSize(24, 24)
@@ -478,7 +548,8 @@ function ns.RefreshCoinIcons()
         local ok = false
         if themed then
             local path = "Interface\\AddOns\\AHWatch\\art\\coin_" .. entry.coin.tier .. "_" .. ns.theme .. ".tga"
-            ok = pcall(entry.icon.SetTexture, entry.icon, path)
+            local called, loaded = pcall(entry.icon.SetTexture, entry.icon, path)
+            ok = called and loaded ~= false
         end
         if not ok then entry.icon:SetTexture(entry.coin.icon) end
     end
@@ -763,6 +834,21 @@ cancelBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 10)
 cancelBtn:SetText("Cancel")
 cancelBtn:Hide()
 
+local ledgerBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+ledgerBtn:SetSize(80, 20)
+ledgerBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 10)
+ledgerBtn:SetText("Ledger")
+ledgerBtn:SetNormalFontObject(GameFontNormalSmall)
+ledgerBtn:SetHighlightFontObject(GameFontHighlightSmall)
+ledgerBtn:SetScript("OnClick", function() if ns.ToggleLedger then ns.ToggleLedger() end end)
+ledgerBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Ledger")
+    GameTooltip:AddLine("Everything you've bought with AH Watch, and what you paid.", 1, 1, 1, true)
+    GameTooltip:Show()
+end)
+ledgerBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
 local bindBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
 bindBtn:SetSize(112, 20)
 bindBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -142, 10)
@@ -877,6 +963,7 @@ local function GoText()
         return "Confirm: " .. purchase.qty .. "x " .. (purchase.name or "") .. " for " .. Money(purchase.total)
     end
     if #list == 0 then return "Add an item to watch" end
+    if state == "idle" and not Ready() then return "Waiting for the server..." end
     if LimitReached() then return "Spend limit reached - raise it or Reset spent" end
     if current > #list then current = 1 end
     local w = list[current]
@@ -905,8 +992,8 @@ function ns.QuickBuySetup(itemID, name, maxCopper)
         if entry.itemID == itemID then idx = i break end
     end
     if not idx then
-        if #AHWatchDB.watch >= 7 then
-            Msg("your watch list is full (7) - remove an item first, or add " .. (name or "this item")
+        if #AHWatchDB.watch >= WATCH_ROWS then
+            Msg("your watch list is full (" .. WATCH_ROWS .. ") - remove an item first, or add " .. (name or "this item")
                 .. " yourself with a smaller max price.")
             return false
         end
@@ -992,6 +1079,7 @@ function Update()
         goBtn:SetText(GoText() .. "  |cff888888(" .. GetKey() .. ")|r")
         cancelBtn:SetShown(state == "pricing" or state == "confirm")
     end
+    ledgerBtn:SetShown(not cancelBtn:IsShown())
     if selectedBrowse and FindWatch(selectedBrowse.itemID) then
         addBtn:SetText("On list (saved)")
         addBtn:Disable()
@@ -1169,6 +1257,8 @@ SlashCmdList["AHWATCH"] = function(msg)
     local ma = (msg or ""):match("^%s*avgqty%s*(%S*)")
     if (msg or ""):match("^%s*data%s*$") and ns.PrintData then
         ns.PrintData()
+    elseif (msg or ""):match("^%s*ledger%s*$") and ns.ToggleLedger then
+        ns.ToggleLedger()
     elseif mb and ns.SetLimit then
         ns.SetLimit(mb)
     elseif ml then
@@ -1214,6 +1304,7 @@ for _, e in ipairs({
     "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", "COMMODITY_SEARCH_RESULTS_UPDATED", "ITEM_SEARCH_RESULTS_UPDATED",
     "COMMODITY_PRICE_UPDATED", "COMMODITY_PRICE_UNAVAILABLE", "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED",
     "AUCTION_HOUSE_THROTTLED_SYSTEM_READY", "PLAYER_MONEY", "GET_ITEM_INFO_RECEIVED",
+    "AUCTION_HOUSE_PURCHASE_COMPLETED",
 }) do
     pcall(ev.RegisterEvent, ev, e)
 end
@@ -1254,6 +1345,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
 
     if e == "AUCTION_HOUSE_SHOW" then
         ahOpen = true
+        lastMoney = GetMoney()
         ApplyKey()
         f:ClearAllPoints()
         local p = AHWatchDB.pos
@@ -1310,8 +1402,9 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         table.sort(rows, function(x, y) return x.unitPrice < y.unitPrice end)
         runtime[a1] = { rows = rows, time = GetTime() }
         if ns.RecordRows then ns.RecordRows(a1, rows, true) end
-        if state == "searching" and w then state = "idle" end
+        if state == "searching" and w then state = "idle"; searchAuto = false end
         if forSell and ns.OnSellResults then ns.OnSellResults(a1, rows, true) end
+        if w then AutoQuote(w) end
         Update()
 
     elseif e == "ITEM_SEARCH_RESULTS_UPDATED" then
@@ -1331,7 +1424,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         table.sort(rows, function(x, y) return x.buyout / math.max(x.quantity, 1) < y.buyout / math.max(y.quantity, 1) end)
         runtime[key.itemID] = { rows = rows, time = GetTime() }
         if ns.RecordRows then ns.RecordRows(key.itemID, rows, false) end
-        if state == "searching" and w then state = "idle" end
+        if state == "searching" and w then state = "idle"; searchAuto = false end
         if forSell and ns.OnSellResults then ns.OnSellResults(key.itemID, rows, false) end
         Update()
 
@@ -1358,15 +1451,22 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         SetState("idle")
 
     elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
+        local w
         if purchase then
             spent = spent + (purchase.total or 0)
-            local w = FindWatch(purchase.itemID)
+            w = FindWatch(purchase.itemID)
             if w then w.bought = (w.bought or 0) + purchase.qty end
+            if ns.AddLedger then ns.AddLedger(purchase.itemID, purchase.name, purchase.qty, purchase.total or 0) end
             Msg("bought " .. purchase.qty .. "x " .. (purchase.name or "item") .. " for " .. Money(purchase.total or 0) .. ".")
             runtime[purchase.itemID] = nil
         end
         purchase = nil
         SetState("idle")
+        -- Refresh straight away if you still want more, so the next press is ready to buy
+        if w and AHWatchDB.watch[current] == w and not (w.maxQty and (w.bought or 0) >= w.maxQty)
+            and not LimitReached() and Ready() then
+            Search(w, true)
+        end
 
     elseif e == "COMMODITY_PURCHASE_FAILED" then
         if purchase then runtime[purchase.itemID] = nil end
@@ -1374,7 +1474,37 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         purchase = nil
         SetState("idle")
 
-    elseif e == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" or e == "PLAYER_MONEY" or e == "GET_ITEM_INFO_RECEIVED" then
+    elseif e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
+        -- The server confirmed an item buyout
+        for i, p in ipairs(pendingBids) do
+            if p.auctionID == a1 then ConfirmBid(i) break end
+        end
+
+    elseif e == "PLAYER_MONEY" then
+        -- Gold going down by a buyout's price also confirms it (for clients
+        -- without the event above). Several can land in one money update.
+        local now = GetMoney()
+        if lastMoney and now < lastMoney and #pendingBids > 0 and state ~= "buying" then
+            local drop = lastMoney - now
+            while drop > 0 and #pendingBids > 0 do
+                local pick
+                for i, p in ipairs(pendingBids) do
+                    if p.price == drop then pick = i break end
+                end
+                if not pick then
+                    for i, p in ipairs(pendingBids) do
+                        if p.price <= drop then pick = i break end
+                    end
+                end
+                if not pick then break end
+                drop = drop - pendingBids[pick].price
+                ConfirmBid(pick)
+            end
+        end
+        lastMoney = now
+        if f:IsShown() then Update() end
+
+    elseif e == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" or e == "GET_ITEM_INFO_RECEIVED" then
         if f:IsShown() then Update() end
     end
 end)
