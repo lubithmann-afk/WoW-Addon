@@ -15,6 +15,8 @@ local BROWSE_ROWS, WATCH_ROWS = 6, 7
 
 local runtime = {}              -- itemID -> { rows = {...}, time = t }
 local browse = {}               -- results of the last name search
+local browseOffset = 0          -- how far the results list is scrolled
+local browseQuery = ""          -- what was searched, to put exact matches first
 local selectedBrowse = nil      -- item picked from the name search
 local state = "idle"            -- idle, searching, pricing, confirm, buying
 local purchase = nil            -- commodity purchase in progress
@@ -715,8 +717,38 @@ for i = 1, BROWSE_ROWS do
     b.sel:SetAllPoints()
     b.sel:SetColorTexture(1, 0.82, 0, 0.15)
     b:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+    -- Scroll the results with the mouse wheel
+    b:EnableMouseWheel(true)
+    b:SetScript("OnMouseWheel", function(_, delta)
+        local maxOffset = math.max(0, #browse - BROWSE_ROWS)
+        browseOffset = math.max(0, math.min(maxOffset, browseOffset - delta * (IsShiftKeyDown() and BROWSE_ROWS or 1)))
+        if Update then Update() end
+    end)
     b:Hide()
     browseRows[i] = b
+end
+-- "7-12 of 20 - scroll for more", next to "Find item:"
+local browseCount = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+browseCount:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -32)
+browseCount:SetJustifyH("RIGHT")
+
+-- Exact name first, then names starting with what you typed, then the rest
+-- (otherwise in the auction house's own order)
+local function SortBrowse()
+    local q = browseQuery
+    if q == "" then return end
+    local function Rank(e)
+        local n = e.name and e.name:lower()
+        if not n then return 3 end
+        if n == q then return 0 end
+        if n:sub(1, #q) == q then return 1 end
+        return 2
+    end
+    for _, e in ipairs(browse) do e.rank = Rank(e) end
+    table.sort(browse, function(a, b)
+        if a.rank ~= b.rank then return a.rank < b.rank end
+        return a.order < b.order
+    end)
 end
 
 -- Max price + add
@@ -1051,10 +1083,18 @@ end
 function Update()
     EnsureDB()
     -- Name search results
+    for _, e in ipairs(browse) do e.name = e.name or ItemName(e.itemID) end
+    SortBrowse()
+    browseOffset = math.max(0, math.min(browseOffset, #browse - BROWSE_ROWS))
+    if #browse > BROWSE_ROWS then
+        browseCount:SetText(string.format("%d-%d of %d - scroll for more", browseOffset + 1,
+            math.min(browseOffset + BROWSE_ROWS, #browse), #browse))
+    else
+        browseCount:SetText("")
+    end
     for i, b in ipairs(browseRows) do
-        local e = browse[i]
+        local e = browse[browseOffset + i]
         if e then
-            e.name = e.name or ItemName(e.itemID)
             b.icon:SetTexture(ItemIcon(e.itemID))
             b.name:SetText(e.name or "Loading...")
             b.price:SetText(e.minPrice and ("from " .. Money(e.minPrice)) or "")
@@ -1158,7 +1198,8 @@ local function PickFromText()
     end
     if text == "" then return end
     if not ahOpen then Msg("open the auction house to search.") return end
-    browse, selectedBrowse = {}, nil
+    browse, selectedBrowse, browseOffset = {}, nil, 0
+    browseQuery = text:lower():gsub("^%s+", ""):gsub("%s+$", "")
     browsePending = true
     local query = {
         searchString = text,
@@ -1427,10 +1468,11 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         browsePending = false
         browse = {}
         local ok, results = pcall(C_AuctionHouse.GetBrowseResults)
+        browseOffset = 0
         for _, res in ipairs((ok and results) or {}) do
-            if res.itemKey and #browse < BROWSE_ROWS then
+            if res.itemKey then
                 table.insert(browse, {
-                    itemID = res.itemKey.itemID, itemKey = res.itemKey,
+                    itemID = res.itemKey.itemID, itemKey = res.itemKey, order = #browse + 1,
                     minPrice = res.minPrice, name = ItemName(res.itemKey.itemID),
                 })
             end
