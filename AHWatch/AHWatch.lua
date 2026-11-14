@@ -263,7 +263,12 @@ local function FailBid(p)
     spent = math.max(0, spent - p.price)
     if p.w then p.w.bought = math.max(0, (p.w.bought or 0) - p.qty) end
     if (p.w and p.w.bought) == 0 then p.w.bought = nil end
-    Msg((p.name or "that item") .. " didn't go through (someone else may have bought it first).")
+    if p.second then
+        Msg("the second buy on that press (" .. (p.name or "item") .. ") didn't go through - if this keeps "
+            .. "happening, your server allows only one buy per press: untick \"2 per press\".")
+    else
+        Msg((p.name or "that item") .. " didn't go through (someone else may have bought it first).")
+    end
     if Update then Update() end
 end
 
@@ -275,7 +280,7 @@ local function ConfirmBid(i)
     Msg("bought " .. qtyText .. (p.name or "item") .. " for " .. Money(p.price) .. ".")
 end
 
-local function Buy(w, plan, auto, manual)
+local function Buy(w, plan, auto, manual, second)
     if plan.kind == "commodity" then
         purchase = { itemID = w.itemID, qty = plan.qty, max = MaxPriceFor(w), name = w.name, expected = plan.total,
             auto = auto, w = w, manual = manual }
@@ -285,21 +290,23 @@ local function Buy(w, plan, auto, manual)
             if not auto then Msg("couldn't start the purchase: " .. tostring(err)) end
             purchase = nil
             SetState("idle")
-            return
+            return false
         end
         Timeout("pricing", 5)
+        return true
     else
         local ok, err = pcall(C_AuctionHouse.PlaceBid, plan.auctionID, plan.price)
         if not ok then
-            Msg("couldn't buy: " .. tostring(err))
-            return
+            if not second then Msg("couldn't buy: " .. tostring(err)) end
+            return false
         end
         -- Counted right away so the spend limit holds while you keep pressing;
         -- taken back off if the server doesn't confirm it (FailBid)
         local qty = plan.row.quantity or 1
         spent = spent + plan.price
         w.bought = (w.bought or 0) + qty
-        local p = { auctionID = plan.auctionID, price = plan.price, qty = qty, itemID = w.itemID, name = w.name, w = w }
+        local p = { auctionID = plan.auctionID, price = plan.price, qty = qty, itemID = w.itemID, name = w.name, w = w,
+            second = second }
         table.insert(pendingBids, p)
         C_Timer.After(BID_TIMEOUT, function()
             for _, q in ipairs(pendingBids) do
@@ -314,8 +321,14 @@ local function Buy(w, plan, auto, manual)
             end
         end
         Update()
+        return true
     end
 end
+
+-- "2 per press": right after a single-listing buy, try the next listing at
+-- or under your price on the same press. Some servers only allow one buy
+-- per press; then the second just doesn't go through (FailBid says so).
+local function TwoPerPress() return AHWatchDB and AHWatchDB.twoPerPress ~= false end
 
 local function ConfirmBuy()
     if not purchase then SetState("idle") return end
@@ -442,14 +455,13 @@ local function BuyGo()
     if state ~= "idle" and lastSource == "manual" then return end   -- the big button is mid-search
     -- An automatic step the game may have ignored: this press sends it for real
     if state == "pricing" and purchase and purchase.auto then
-        if not Ready() then return end
         purchase.auto = false
         local ok = pcall(C_AuctionHouse.StartCommoditiesPurchase, purchase.itemID, purchase.qty)
         if ok then Timeout("pricing", 5) else purchase = nil; SetState("idle") end
         return
     end
     if state ~= "idle" then return end
-    if not Ready() then return end
+    -- (Buying doesn't wait for the server to finish background searches)
     if LimitReached() then Msg("spend limit reached - raise it or press Reset spent.") return end
     if not AutoSearchOn() then
         Msg("turn on Watch all - this button buys what it finds. The big button searches item by item.")
@@ -461,7 +473,13 @@ local function BuyGo()
     if bw then
         lastSource = "watch"
         current = i
-        Buy(bw, plan)
+        if Buy(bw, plan) and plan.kind == "item" and TwoPerPress() then
+            local bw2, plan2, i2 = NextPlan()
+            if bw2 and plan2.kind == "item" then
+                current = i2
+                Buy(bw2, plan2, false, false, true)
+            end
+        end
     end
     -- Nothing found yet: Watch all keeps looking; the button says so
 end
@@ -926,6 +944,27 @@ cycleBox:SetScript("OnClick", function(self)
     if Update then Update() end
 end)
 
+-- 2 per press (on by default)
+local twoBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+twoBox:SetSize(20, 20)
+twoBox:SetPoint("TOPLEFT", f, "TOPLEFT", 158, -298)
+local twoLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+twoLabel:SetPoint("LEFT", twoBox, "RIGHT", 2, 0)
+twoLabel:SetText("2 per press")
+twoBox:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
+    GameTooltip:AddLine("2 per press", 1, 1, 1)
+    GameTooltip:AddLine("For single listings (gear and other non-stacking items), each press tries to buy the two cheapest at or under your price instead of one.", 1, 0.9, 0.6, true)
+    GameTooltip:AddLine("Stackable goods already buy every unit at your price in one press.", 1, 0.9, 0.6, true)
+    GameTooltip:AddLine("Some servers only allow one buy per press - if chat keeps saying the second buy didn't go through, untick this.", 1, 0.9, 0.6, true)
+    GameTooltip:Show()
+end)
+twoBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
+twoBox:SetScript("OnClick", function(self)
+    EnsureDB()
+    AHWatchDB.twoPerPress = self:GetChecked() and true or false
+end)
+
 -- Keep searching the whole list in the background (on by default)
 local autoBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
 autoBox:SetSize(20, 20)
@@ -1236,7 +1275,6 @@ function ManualGo()
     end
     if state == "confirm" and purchase and purchase.manual then ConfirmBuy() return end
     if state == "pricing" and purchase and purchase.manual and purchase.auto then
-        if not Ready() then return end
         purchase.auto = false
         local ok = pcall(C_AuctionHouse.StartCommoditiesPurchase, purchase.itemID, purchase.qty)
         if ok then Timeout("pricing", 5) else purchase = nil; SetState("idle") end
@@ -1246,19 +1284,23 @@ function ManualGo()
         if Ready() then Search(w) end
         return
     end
-    if state ~= "idle" or not Ready() then return end
+    if state ~= "idle" then return end
     if LimitReached() then Msg("spend limit reached - raise it or press Reset spent.") return end
     lastSource = "manual"
     local r = runtime[w.itemID]
     if not r or not r.rows or GetTime() - r.time > STALE_AFTER then
-        Search(w)
+        if Ready() then Search(w) end
         return
     end
     local plan, summary = Plan(w)
     if plan then
-        Buy(w, plan, false, true)
+        if Buy(w, plan, false, true) and plan.kind == "item" and TwoPerPress() then
+            local plan2 = Plan(w)
+            if plan2 and plan2.kind == "item" then Buy(w, plan2, false, true, true) end
+        end
         return
     end
+    if not Ready() then return end   -- the rest searches, which has to wait for the server
     -- Nothing to buy on this item: move on to the next one (Cycle list),
     -- or look at this one again
     local nxt, idx = NextAfter(w)
@@ -1631,6 +1673,9 @@ for _, b in ipairs(watchRows) do
 end
 
 goBtn:SetScript("OnClick", Go)
+-- Act the moment the key (or mouse button) goes down, not when it's let go
+goBtn:RegisterForClicks("AnyDown")
+manualBtn:RegisterForClicks("AnyDown")
 C_Timer.NewTicker(0.5, function()
     if ahOpen and f:IsShown() and CurrentTab() == "buy" then Update() end
 end)
@@ -1731,6 +1776,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         capMoney.SetValue(AHWatchDB.capCopper or 0)
         autoBox:SetChecked(AHWatchDB.autoSearch ~= false)
         cycleBox:SetChecked(AHWatchDB.cycleList ~= false)
+        twoBox:SetChecked(AHWatchDB.twoPerPress ~= false)
         return
     end
     if not AHWatchDB then return end
