@@ -298,7 +298,18 @@ local TINT = {
     btnHi     = { 1, 1, 1, 1 },
 }
 
+-- A second main-action colour (the buy-instantly button), so it stands apart
+-- from the big red one while still fitting each look
+local ALT = {
+    classic   = { 0.95, 0.74, 0.28 },
+    auction   = { 0.95, 0.74, 0.28 },
+    spacew    = { 0.88, 0.70, 0.38 },
+    onlylawns = { 0.50, 0.80, 0.32 },
+    trader    = { 0.12, 0.38, 0.66 },
+}
+
 local function ButtonRole(b)
+    if b.pbAlt then return "alt" end
     if b:GetName() == "AHWatchGoButton" or b.pbPrimary then return "primary" end
     if b:GetText() == "Cancel" then return "danger" end
     return "btn"
@@ -309,6 +320,22 @@ local function RefreshButton(b)
     if not st then return end
     local role = ButtonRole(b)
     local hovered = b:IsMouseOver() and b:IsEnabled()
+    if role == "alt" then
+        local c = ALT[mode] or ALT.classic
+        local k = hovered and 1.2 or 1
+        local a = b:IsEnabled() and 1 or 0.5
+        if mode == "trader" then
+            SafeGradient(st.bg, true, { c[1] * 0.78 * k, c[2] * 0.78 * k, c[3] * 0.78 * k, a },
+                { c[1] * 1.28 * k, c[2] * 1.28 * k, c[3] * 1.28 * k, a })
+        else
+            -- Grey out the game's red button art, then colour it
+            for _, p in ipairs(st.parts) do
+                if p.SetDesaturated then p:SetDesaturated(true) end
+                p:SetVertexColor(math.min(1, c[1] * k), math.min(1, c[2] * k), math.min(1, c[3] * k), a)
+            end
+        end
+        return
+    end
     if mode == "trader" then
         local normal = (role == "primary" and C.primary) or (role == "danger" and C.danger) or C.btn
         local hover = (role == "primary" and C.primaryHi) or (role == "danger" and C.dangerHi) or C.btnHover

@@ -33,7 +33,11 @@ local BID_TIMEOUT = 8           -- seconds before an unconfirmed buyout counts a
 local itemInfoQueued = false
 local manualW = nil             -- the watch-list item the Search & buy button works on
 local selectedWatchID = nil     -- the watch-list item you clicked (Search & buy's target)
-local lastSource = "watch"      -- which button started what's happening: "watch" or "manual"
+-- Which button started what's happening: "manual" = the big button (searches
+-- and buys the item you clicked, cycling through the list), "watch" = the
+-- buy-instantly button (buys whatever Watch all has found)
+local lastSource = "watch"
+local ManualGo                  -- the big button, defined further down
 local ManualQuote               -- defined with the Search & buy button
 local latePurchase = nil        -- a purchase that timed out mid-buy, in case it still goes through
 local Update                    -- defined further down
@@ -200,15 +204,17 @@ end
 local function MoveOn()
     local list = AHWatchDB and AHWatchDB.watch
     if not list or #list == 0 then return end
-    if current > #list then current = 1 end
-    local stuck = list[current]
+    local idx = 1
+    for i, w in ipairs(list) do if w.itemID == selectedWatchID then idx = i end end
+    local stuck = list[idx]
     runtime[stuck.itemID] = nil
     local name = stuck.name or "that item"
-    if #list < 2 then
+    if #list < 2 or AHWatchDB.cycleList == false then
         Msg(name .. " got stuck - press again to retry.")
         return
     end
-    current = current % #list + 1
+    current = idx % #list + 1
+    selectedWatchID = list[current].itemID
     Msg(name .. " got stuck - moved on to " .. (list[current].name or "the next item") .. ".")
 end
 
@@ -227,7 +233,7 @@ local function Timeout(expected, seconds)
             if expected == "buying" then latePurchase = purchase end
             purchase = nil
             searchAuto = false
-            if expected ~= "confirm" and not auto and lastSource == "watch" then MoveOn() end
+            if expected ~= "confirm" and not auto and lastSource == "manual" then MoveOn() end
             SetState("idle")
         end
     end)
@@ -357,8 +363,10 @@ end
 -- Get a commodity's price ready ahead of time, so the next press buys it
 -- outright (the game needs a price check between "start" and "buy").
 -- Only gets a price quote; nothing is bought without a press.
+local AutoSearchOn
 local function AutoQuote(w)
     if not ahOpen or state ~= "idle" or CurrentTab() ~= "buy" or not Ready() then return end
+    if not AutoSearchOn() then return end
     local nw, plan, i = NextPlan()
     if not nw or plan.kind ~= "commodity" then return end   -- a press can buy something right now anyway
     if w and nw ~= w then return end
@@ -373,13 +381,13 @@ end
 -- press; only buying needs one), so presses go to buying, not searching.
 ------------------------------------------------------------
 
-local BG_EVERY = 1.2           -- seconds between background searches
-local BG_REFRESH = 10          -- re-search an item once its results are this old
+local BG_EVERY = 0.3           -- as fast as the server's own throttle allows
+local BG_REFRESH = 1.5         -- re-search an item once its results are this old
 local bgPending = nil          -- { itemID, t } background search waiting for results
 local bgLast, bgMisses = 0, 0
 local bgBroken = false         -- the game ignored background searches: presses search instead
 
-local function AutoSearchOn() return AHWatchDB and AHWatchDB.autoSearch ~= false and not bgBroken end
+function AutoSearchOn() return AHWatchDB and AHWatchDB.autoSearch ~= false and not bgBroken end
 
 local function BackgroundSearch()
     if not AutoSearchOn() or not ahOpen or state ~= "idle" or CurrentTab() ~= "buy" then return end
@@ -400,6 +408,8 @@ local function BackgroundSearch()
     if now - bgLast < BG_EVERY or not Ready() then return end
     local list = AHWatchDB.watch
     if #list == 0 then return end
+    -- A deal is waiting: leave the server free so your press buys it at once
+    if NextPlan() then return end
     -- The item with the oldest results (or none yet)
     local pick, oldest
     for _, w in ipairs(list) do
@@ -428,9 +438,8 @@ local function BuyGo()
     local list = AHWatchDB.watch
     if not ahOpen then Msg("open the auction house first.") return end
     if #list == 0 then Msg("add an item to your watch list first.") return end
-    if purchase and purchase.manual then return end   -- that one belongs to the Search & buy button
-    if state ~= "idle" and lastSource == "manual" then return end
-    if state == "confirm" then ConfirmBuy() return end
+    if state == "confirm" then ConfirmBuy() return end   -- a deal is lined up: buy it
+    if state ~= "idle" and lastSource == "manual" then return end   -- the big button is mid-search
     -- An automatic step the game may have ignored: this press sends it for real
     if state == "pricing" and purchase and purchase.auto then
         if not Ready() then return end
@@ -439,35 +448,22 @@ local function BuyGo()
         if ok then Timeout("pricing", 5) else purchase = nil; SetState("idle") end
         return
     end
-    if state == "searching" and searchAuto then
-        if not Ready() then return end
-        local w = list[current]
-        if w then Search(w) end
-        return
-    end
     if state ~= "idle" then return end
     if not Ready() then return end
     if LimitReached() then Msg("spend limit reached - raise it or press Reset spent.") return end
-
+    if not AutoSearchOn() then
+        Msg("turn on Watch all - this button buys what it finds. The big button searches item by item.")
+        return
+    end
     if current > #list then current = 1 end
-    lastSource = "watch"
     -- Anything on the list at or under its price right now: buy it on this press
     local bw, plan, i = NextPlan()
     if bw then
+        lastSource = "watch"
         current = i
         Buy(bw, plan)
-        return
     end
-    -- Nothing to buy: this press refreshes instead - the current item if its
-    -- results are old, otherwise the next one
-    local w = list[current]
-    local r = runtime[w.itemID]
-    if not r or not r.rows or GetTime() - r.time > STALE_AFTER then
-        Search(w)
-        return
-    end
-    current = current % #list + 1
-    Search(list[current])
+    -- Nothing found yet: Watch all keeps looking; the button says so
 end
 
 -- The single Go button/keybind is shared across tabs - Buy has its
@@ -484,7 +480,7 @@ local function Go()
         if ns.SetTab then ns.SetTab("buy") end
         return
     end
-    BuyGo()
+    if ManualGo then ManualGo() end
 end
 
 ------------------------------------------------------------
@@ -906,26 +902,49 @@ addBtn:SetText("Add to list")
 addBtn.pbPrimary = true
 
 -- Watch list
-Label("Watch list:", 14, -336)
+Label("Watch list:", 14, -300)
+
+-- Cycle list: when the big button finds nothing on the item you clicked,
+-- move on to the next item (checked) or keep re-checking that one (unchecked)
+local cycleBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+cycleBox:SetSize(20, 20)
+cycleBox:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -298)
+local cycleLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+cycleLabel:SetPoint("RIGHT", cycleBox, "LEFT", -2, 0)
+cycleLabel:SetText("Cycle list")
+cycleBox:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
+    GameTooltip:AddLine("Cycle list", 1, 1, 1)
+    GameTooltip:AddLine("Checked: when the big button finds nothing at your price on the item you clicked, it moves on to the next item on the list.", 1, 0.9, 0.6, true)
+    GameTooltip:AddLine("Unchecked: it keeps re-checking just the item you clicked.", 1, 0.9, 0.6, true)
+    GameTooltip:Show()
+end)
+cycleBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
+cycleBox:SetScript("OnClick", function(self)
+    EnsureDB()
+    AHWatchDB.cycleList = self:GetChecked() and true or false
+    if Update then Update() end
+end)
 
 -- Keep searching the whole list in the background (on by default)
 local autoBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
 autoBox:SetSize(20, 20)
-autoBox:SetPoint("TOPLEFT", f, "TOPLEFT", 84, -334)
+autoBox:SetPoint("TOPLEFT", f, "TOPLEFT", 84, -298)
 local autoLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 autoLabel:SetPoint("LEFT", autoBox, "RIGHT", 2, 0)
 autoLabel:SetText("Watch all")
 autoBox:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
     GameTooltip:AddLine("Watch all", 1, 1, 1)
-    GameTooltip:AddLine("Checked: keeps searching every item on your list in the background, so each press of your key buys whatever is at or under your price - no presses spent on searching.", 1, 0.9, 0.6, true)
-    GameTooltip:AddLine("Unchecked: presses search the list one item at a time.", 1, 0.9, 0.6, true)
+    GameTooltip:AddLine("Checked: keeps searching every item on your list in the background as fast as the server allows, so each press of the Buy instantly button buys whatever it found at or under your price.", 1, 0.9, 0.6, true)
+    GameTooltip:AddLine("The big button still searches and buys the item you clicked, either way.", 1, 0.9, 0.6, true)
     GameTooltip:Show()
 end)
 autoBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
 autoBox:SetScript("OnClick", function(self)
     EnsureDB()
     AHWatchDB.autoSearch = self:GetChecked() and true or false
+    if AHWatchDB.autoSearch then bgBroken, bgMisses = false, 0 end   -- try again
     if Update then Update() end
 end)
 
@@ -933,7 +952,7 @@ local watchRows = {}
 for i = 1, WATCH_ROWS do
     local b = CreateFrame("Button", nil, f)
     b:SetSize(330, 28)
-    b:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -352 - (i - 1) * 30)
+    b:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -316 - (i - 1) * 30)
     b.icon = b:CreateTexture(nil, "ARTWORK")
     b.icon:SetSize(24, 24)
     b.icon:SetPoint("LEFT", 2, 0)
@@ -960,13 +979,13 @@ for i = 1, WATCH_ROWS do
 end
 
 -- Spend limit
-Label("Spend limit:", 14, -570)
-local capMoney = MoneyInput(22, -586)
+Label("Spend limit:", 14, -534)
+local capMoney = MoneyInput(22, -550)
 local spentLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-spentLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -616)
+spentLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -580)
 local resetBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
 resetBtn:SetSize(90, 20)
-resetBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -612)
+resetBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -576)
 resetBtn:SetText("Reset spent")
 resetBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
@@ -1077,7 +1096,7 @@ local IGNORE_KEYS = { LSHIFT = true, RSHIFT = true, LCTRL = true, RCTRL = true, 
 -- Left-click a key button, then press a key; right-click puts it back to the default
 local function KeyButtonClick(which, button)
     local default = (which == "keybind") and DEFAULT_KEY or DEFAULT_MANUAL_KEY
-    local label = (which == "keybind") and "the watch-list button" or "Search & buy"
+    local label = (which == "keybind") and "the big button" or "Buy instantly"
     if button == "RightButton" then
         AHWatchDB[which] = nil
         ApplyKey()
@@ -1116,7 +1135,7 @@ local function KeyTooltip(self, title)
 end
 
 bindBtn:SetScript("OnClick", function(_, button) KeyButtonClick("keybind", button) end)
-bindBtn:SetScript("OnEnter", function(self) KeyTooltip(self, "Watch-list button key") end)
+bindBtn:SetScript("OnEnter", function(self) KeyTooltip(self, "Big button key") end)
 bindBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
 ------------------------------------------------------------
@@ -1128,8 +1147,8 @@ bindBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
 local manualBtn = CreateFrame("Button", "AHWatchManualButton", f, "UIPanelButtonTemplate")
 manualBtn:SetSize(248, 26)
-manualBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -296)
-manualBtn.pbPrimary = true
+manualBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 72)
+manualBtn.pbAlt = true     -- its own colour, apart from the big button
 manualBtn:SetNormalFontObject(GameFontNormalSmall)
 manualBtn:SetHighlightFontObject(GameFontHighlightSmall)
 manualBtn:SetDisabledFontObject(GameFontDisableSmall)
@@ -1141,22 +1160,23 @@ manualKeyBtn:SetNormalFontObject(GameFontNormalSmall)
 manualKeyBtn:SetHighlightFontObject(GameFontHighlightSmall)
 manualKeyBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 manualKeyBtn:SetScript("OnClick", function(_, button) KeyButtonClick("manualKeybind", button) end)
-manualKeyBtn:SetScript("OnEnter", function(self) KeyTooltip(self, "Search & buy key") end)
+manualKeyBtn:SetScript("OnEnter", function(self) KeyTooltip(self, "Buy instantly key") end)
 manualKeyBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 manualBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
-    GameTooltip:SetText("Search & buy (selected item)")
-    GameTooltip:AddLine("Works on the item you clicked in your watch list: a press searches it, the next press buys "
-        .. "whatever is at or under its max price.", 1, 1, 1, true)
+    GameTooltip:SetText("Buy instantly")
+    GameTooltip:AddLine("With Watch all on, every item on your list is checked in the background as fast as the "
+        .. "server allows. Each press buys whatever was found at or under its max price - no picking, no searching.", 1, 1, 1, true)
     GameTooltip:Show()
 end)
 manualBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 goBtn:SetScript("OnEnter", function(self)
     if CurrentTab() ~= "buy" then return end
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
-    GameTooltip:SetText("Buy from the watch list")
-    GameTooltip:AddLine("Buys whatever on your watch list is at or under its max price right now - "
-        .. "no need to pick the item.", 1, 1, 1, true)
+    GameTooltip:SetText("Search and buy")
+    GameTooltip:AddLine("Works on the item you clicked in your watch list: a press searches it, the next press buys "
+        .. "whatever is at or under its max price.", 1, 1, 1, true)
+    GameTooltip:AddLine("With Cycle list checked it moves on to the next item when nothing is found.", 1, 1, 1, true)
     GameTooltip:Show()
 end)
 goBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1170,8 +1190,23 @@ local function ManualTarget()
             return w
         end
     end
+    -- Nothing clicked yet: start at the top of the list
+    if list[1] then
+        selectedWatchID = list[1].itemID
+        manualW = list[1]
+        return list[1]
+    end
     manualW = nil
-    return nil, (#list == 0) and "add an item to your watch list" or "click an item in your watch list"
+    return nil, "add an item to your watch list"
+end
+
+-- With "Cycle list" on, the item after the selected one
+local function NextAfter(w)
+    local list = AHWatchDB.watch
+    if AHWatchDB.cycleList == false or #list < 2 then return nil end
+    for i, x in ipairs(list) do
+        if x == w then return list[i % #list + 1], i % #list + 1 end
+    end
 end
 
 -- After its search: get a stackable item's price ready, so the next press buys
@@ -1184,11 +1219,11 @@ function ManualQuote()
     end
 end
 
-local function ManualGo()
+function ManualGo()
     EnsureDB()
     if not ahOpen then Msg("open the auction house first.") return end
     local w, why = ManualTarget()
-    if not w then Msg("Search & buy: " .. why .. ".") return end
+    if not w then Msg(why .. " first.") return end
     -- Something the other button lined up by itself
     if (state == "pricing" or state == "confirm") and purchase and not purchase.manual then
         if purchase.itemID == w.itemID then
@@ -1222,17 +1257,26 @@ local function ManualGo()
     local plan, summary = Plan(w)
     if plan then
         Buy(w, plan, false, true)
+        return
+    end
+    -- Nothing to buy on this item: move on to the next one (Cycle list),
+    -- or look at this one again
+    local nxt, idx = NextAfter(w)
+    if nxt then
+        selectedWatchID, current = nxt.itemID, idx
+        manualW = nxt
+        Search(nxt)
     elseif summary and summary.note then
         Msg((w.name or "that item") .. ": " .. summary.note .. ".")
     else
-        Search(w)   -- nothing at that price right now: look again
+        Search(w)
     end
 end
 
 local function ManualText()
-    if not ahOpen then return "Search & buy: open the Auction House" end
+    if not ahOpen then return "Open the Auction House" end
     local w, why = ManualTarget()
-    if not w then return "Search & buy: " .. why end
+    if not w then return (why:gsub("^%l", string.upper)) end
     local name = w.name or "item"
     if lastSource == "manual" or (purchase and purchase.manual) then
         if state == "searching" then return "Searching " .. name .. "..." end
@@ -1242,7 +1286,7 @@ local function ManualText()
             return "BUY " .. purchase.qty .. "x " .. name .. " for " .. Money(purchase.total)
         end
     elseif state ~= "idle" then
-        return "Search & buy: " .. name
+        return name .. " - waiting for the other button..."
     end
     if LimitReached() then return "Spend limit reached" end
     local r = runtime[w.itemID]
@@ -1253,6 +1297,8 @@ local function ManualText()
     elseif plan then
         return "BUY " .. name .. " for " .. Money(plan.price)
     end
+    local nxt = NextAfter(w)
+    if nxt then return "None at your price - next: " .. (nxt.name or "next item") end
     if summary and summary.note then return name .. ": " .. summary.note end
     return "None at your price - search again"
 end
@@ -1263,9 +1309,13 @@ end
 
 local function GoText()
     local list = AHWatchDB.watch
-    if not ahOpen then return "Open the Auction House" end
-    if state ~= "idle" and (lastSource == "manual" or (purchase and purchase.manual)) then
-        return "Watch list - waiting for Search & buy..."
+    if not ahOpen then return "Buy instantly: open the Auction House" end
+    if #list == 0 then return "Buy instantly: add items to watch" end
+    if not AutoSearchOn() then
+        return bgBroken and "Buy instantly: background search unavailable" or "Buy instantly: turn on Watch all"
+    end
+    if state ~= "idle" and (lastSource == "manual" or (purchase and purchase.manual)) and state ~= "confirm" then
+        return "Buy instantly - waiting for the big button..."
     end
     if state == "searching" then return "Searching..." end
     if state == "pricing" then return "Checking the price of " .. ((purchase and purchase.name) or "it") .. "..." end
@@ -1275,7 +1325,6 @@ local function GoText()
     end
     if #list == 0 then return "Add an item to watch" end
     if LimitReached() then return "Spend limit reached - raise it or Reset spent" end
-    if state == "idle" and not Ready() then return "Waiting for the server..." end
     if current > #list then current = 1 end
     local bw, plan = NextPlan()
     if plan and plan.kind == "commodity" then
@@ -1283,17 +1332,8 @@ local function GoText()
     elseif plan then
         return "BUY " .. (bw.name or "item") .. " for " .. Money(plan.price)
     end
-    if AutoSearchOn() then
-        local n = #list
-        return "Watching " .. n .. " item" .. (n == 1 and "" or "s") .. " - nothing at your price yet"
-    end
-    local w = list[current]
-    local r = runtime[w.itemID]
-    if not r or not r.rows or GetTime() - r.time > STALE_AFTER then
-        return "Search: " .. (w.name or "item")
-    end
-    local nextW = list[current % #list + 1]
-    return "None under price - check " .. (nextW.name or "next")
+    local n = #list
+    return "Watching " .. n .. " item" .. (n == 1 and "" or "s") .. " - nothing at your price yet"
 end
 
 -- Used by Flip opportunities (Prices.lua): adds an item to the watch list at
@@ -1319,6 +1359,7 @@ function ns.QuickBuySetup(itemID, name, maxCopper)
     w.maxCopper, w.maxPct = maxCopper, nil
     w.name = w.name or name
     current = idx
+    selectedWatchID = w.itemID
     if ns.SetTab then ns.SetTab("buy") end
     f:Show()
     if Update then Update() end
@@ -1399,7 +1440,8 @@ function Update()
     if LimitReached() then capText = capText .. " |cffff5555- limit reached|r" end
     spentLabel:SetText("Spent: " .. Money(spent) .. capText)
     if CurrentTab() == "buy" then
-        goBtn:SetText(GoText() .. "  |cff888888(" .. GetKey() .. ")|r")
+        goBtn:SetText(ManualText() .. "  |cff888888(" .. GetKey() .. ")|r")
+        manualBtn:SetText(GoText() .. "  |cff888888(" .. GetManualKey() .. ")|r")
         cancelBtn:SetShown(state == "pricing" or state == "confirm")
     end
     ledgerBtn:SetShown(not cancelBtn:IsShown())
@@ -1412,7 +1454,7 @@ function Update()
     end
     bindBtn:SetText(capturing == "keybind" and "Press a key..." or ("Key: " .. GetKey()))
     manualKeyBtn:SetText(capturing == "manualKeybind" and "Press a key..." or ("Key: " .. GetManualKey()))
-    if CurrentTab() == "buy" then manualBtn:SetText(ManualText()) end
+
     ThemeLabel()
 
     local e = selectedBrowse
@@ -1589,8 +1631,11 @@ for _, b in ipairs(watchRows) do
 end
 
 goBtn:SetScript("OnClick", Go)
+C_Timer.NewTicker(0.5, function()
+    if ahOpen and f:IsShown() and CurrentTab() == "buy" then Update() end
+end)
 -- On other tabs the Search & buy button is covered up, so its key does nothing there
-manualBtn:SetScript("OnClick", function() if CurrentTab() == "buy" then ManualGo() end end)
+manualBtn:SetScript("OnClick", function() if CurrentTab() == "buy" then BuyGo() end end)
 cancelBtn:SetScript("OnClick", CancelBuy)
 f:SetScript("OnShow", Update)
 
@@ -1685,12 +1730,14 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         end
         capMoney.SetValue(AHWatchDB.capCopper or 0)
         autoBox:SetChecked(AHWatchDB.autoSearch ~= false)
+        cycleBox:SetChecked(AHWatchDB.cycleList ~= false)
         return
     end
     if not AHWatchDB then return end
 
     if e == "AUCTION_HOUSE_SHOW" then
         ahOpen = true
+        bgBroken, bgMisses, bgPending = false, 0, nil
         lastMoney = GetMoney()
         ApplyKey()
         f:ClearAllPoints()
@@ -1830,13 +1877,8 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
             return
         end
         -- Refresh straight away if you still want more, so the next press is ready to buy
-        if w and not (p and p.manual) and AHWatchDB.watch[current] == w and not (w.maxQty and (w.bought or 0) >= w.maxQty)
-            and not LimitReached() then
-            if AutoSearchOn() then
-                bgLast = 0   -- the background watcher refreshes it straight away
-            elseif Ready() then
-                Search(w, true)
-            end
+        if not (p and p.manual) and AutoSearchOn() then
+            bgLast = 0   -- Watch all refreshes it straight away
         end
 
     elseif e == "COMMODITY_PURCHASE_FAILED" then
