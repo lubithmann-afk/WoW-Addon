@@ -330,11 +330,94 @@ ns.CurrentTab = CurrentTab
 -- Right after fresh results for a commodity, ask for its price straight away
 -- so the next press can confirm - one press per batch instead of two.
 -- (Only gets a price quote; nothing is bought without a press.)
+-- The next thing worth buying across the whole watch list (fresh results
+-- only), starting from the current item. With "Cycle list" unchecked, only
+-- the current item counts.
+local function NextPlan()
+    local list = AHWatchDB.watch
+    local n = #list
+    if n == 0 or LimitReached() then return nil end
+    if current > n then current = 1 end
+    local count = (AHWatchDB.cycleList == false) and 1 or n
+    for k = 0, count - 1 do
+        local i = (current - 1 + k) % n + 1
+        local w = list[i]
+        local r = runtime[w.itemID]
+        if r and r.rows and GetTime() - r.time <= STALE_AFTER then
+            local plan = Plan(w)
+            if plan then return w, plan, i end
+        end
+    end
+end
+
+-- Get a commodity's price ready ahead of time, so the next press buys it
+-- outright (the game needs a price check between "start" and "buy").
+-- Only gets a price quote; nothing is bought without a press.
 local function AutoQuote(w)
-    if not ahOpen or state ~= "idle" or CurrentTab() ~= "buy" then return end
-    if AHWatchDB.watch[current] ~= w or not w.isCommodity or not Ready() then return end
-    local plan = Plan(w)
-    if plan and plan.kind == "commodity" then Buy(w, plan, true) end
+    if not ahOpen or state ~= "idle" or CurrentTab() ~= "buy" or not Ready() then return end
+    local nw, plan, i = NextPlan()
+    if not nw or plan.kind ~= "commodity" then return end   -- a press can buy something right now anyway
+    if w and nw ~= w then return end
+    current = i
+    Buy(nw, plan, true)
+end
+
+------------------------------------------------------------
+-- Watching the whole list: while the Buy tab is open, keep every watched
+-- item's results fresh in the background (searches are allowed without a
+-- press; only buying needs one), so presses go to buying, not searching.
+------------------------------------------------------------
+
+local BG_EVERY = 1.2           -- seconds between background searches
+local BG_REFRESH = 10          -- re-search an item once its results are this old
+local bgPending = nil          -- { itemID, t } background search waiting for results
+local bgLast, bgMisses = 0, 0
+local bgBroken = false         -- the game ignored background searches: presses search instead
+
+local function AutoSearchOn() return AHWatchDB and AHWatchDB.autoSearch ~= false and not bgBroken end
+
+local function BackgroundSearch()
+    if not AutoSearchOn() or not ahOpen or state ~= "idle" or CurrentTab() ~= "buy" then return end
+    if not (AHWatchFrame and AHWatchFrame:IsShown()) then return end
+    local now = GetTime()
+    if bgPending then
+        if now - bgPending.t < 5 then return end
+        -- No answer: after a few in a row, this client doesn't allow it
+        bgPending = nil
+        bgMisses = bgMisses + 1
+        if bgMisses >= 3 then
+            bgBroken = true
+            Msg("this game client won't search in the background, so each press will search when needed instead.")
+            if Update then Update() end
+            return
+        end
+    end
+    if now - bgLast < BG_EVERY or not Ready() then return end
+    local list = AHWatchDB.watch
+    if #list == 0 then return end
+    -- The item with the oldest results (or none yet)
+    local pick, oldest
+    local only = (AHWatchDB.cycleList == false) and list[math.min(current, #list)] or nil
+    for _, w in ipairs(list) do
+        if not only or w == only then
+            local r = runtime[w.itemID]
+            local age = (r and r.rows) and (now - r.time) or math.huge
+            if age > BG_REFRESH and (not oldest or age > oldest) then pick, oldest = w, age end
+        end
+    end
+    if not pick then return end
+    local key = pick.itemKey or C_AuctionHouse.MakeItemKey(pick.itemID)
+    local ok = pcall(C_AuctionHouse.SendSearchQuery, key, { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
+    bgLast = now
+    if ok then bgPending = { itemID = pick.itemID, t = now } end
+end
+C_Timer.NewTicker(0.3, BackgroundSearch)
+
+local function BgResults(itemID)
+    if bgPending and bgPending.itemID == itemID then
+        bgPending = nil
+        bgMisses = 0
+    end
 end
 
 -- The one button on the Buy tab: refresh, buy, confirm, or move to the next item
@@ -360,23 +443,22 @@ local function BuyGo()
     end
     if state ~= "idle" then return end
     if not Ready() then return end
+    if LimitReached() then Msg("spend limit reached - raise it or press Reset spent.") return end
 
     if current > #list then current = 1 end
+    -- Anything on the list at or under its price right now: buy it on this press
+    local bw, plan, i = NextPlan()
+    if bw then
+        current = i
+        Buy(bw, plan)
+        return
+    end
+    -- Nothing to buy: this press refreshes instead - the current item if its
+    -- results are old, otherwise the next one (or the same one again with
+    -- "Cycle list" unchecked)
     local w = list[current]
     local r = runtime[w.itemID]
-    if not r or not r.rows or GetTime() - r.time > STALE_AFTER then
-        Search(w)
-        return
-    end
-    local plan = Plan(w)
-    if plan then
-        Buy(w, plan)
-        return
-    end
-    -- Nothing to buy on this item right now: check the next one, unless
-    -- "Cycle list" is unchecked, in which case stay locked on this one and
-    -- just refresh its search instead of hopping to another item.
-    if AHWatchDB.cycleList == false then
+    if not r or not r.rows or GetTime() - r.time > STALE_AFTER or AHWatchDB.cycleList == false then
         Search(w)
         return
     end
@@ -843,6 +925,28 @@ cycleBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
 cycleBox:SetScript("OnClick", function(self)
     EnsureDB()
     AHWatchDB.cycleList = self:GetChecked() and true or false
+    if Update then Update() end
+end)
+
+-- Keep searching the whole list in the background (on by default)
+local autoBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+autoBox:SetSize(20, 20)
+autoBox:SetPoint("TOPLEFT", f, "TOPLEFT", 84, -298)
+local autoLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+autoLabel:SetPoint("LEFT", autoBox, "RIGHT", 2, 0)
+autoLabel:SetText("Watch all")
+autoBox:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
+    GameTooltip:AddLine("Watch all", 1, 1, 1)
+    GameTooltip:AddLine("Checked: keeps searching every item on your list in the background, so each press of your key buys whatever is at or under your price - no presses spent on searching.", 1, 0.9, 0.6, true)
+    GameTooltip:AddLine("Unchecked: presses search the list one item at a time.", 1, 0.9, 0.6, true)
+    GameTooltip:Show()
+end)
+autoBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
+autoBox:SetScript("OnClick", function(self)
+    EnsureDB()
+    AHWatchDB.autoSearch = self:GetChecked() and true or false
+    if Update then Update() end
 end)
 
 local watchRows = {}
@@ -1028,22 +1132,26 @@ local function GoText()
     if state == "pricing" then return "Checking the price..." end
     if state == "buying" then return "Buying..." end
     if state == "confirm" and purchase then
-        return "Confirm: " .. purchase.qty .. "x " .. (purchase.name or "") .. " for " .. Money(purchase.total)
+        return "BUY " .. purchase.qty .. "x " .. (purchase.name or "") .. " for " .. Money(purchase.total)
     end
     if #list == 0 then return "Add an item to watch" end
-    if state == "idle" and not Ready() then return "Waiting for the server..." end
     if LimitReached() then return "Spend limit reached - raise it or Reset spent" end
+    if state == "idle" and not Ready() then return "Waiting for the server..." end
     if current > #list then current = 1 end
+    local bw, plan = NextPlan()
+    if plan and plan.kind == "commodity" then
+        return "Buy " .. plan.qty .. "x " .. (bw.name or "") .. " for " .. Money(plan.total)
+    elseif plan then
+        return "BUY " .. (bw.name or "item") .. " for " .. Money(plan.price)
+    end
+    if AutoSearchOn() then
+        local n = (AHWatchDB.cycleList == false) and 1 or #list
+        return "Watching " .. n .. " item" .. (n == 1 and "" or "s") .. " - nothing at your price yet"
+    end
     local w = list[current]
     local r = runtime[w.itemID]
     if not r or not r.rows or GetTime() - r.time > STALE_AFTER then
         return "Search: " .. (w.name or "item")
-    end
-    local plan = Plan(w)
-    if plan and plan.kind == "commodity" then
-        return "Buy " .. plan.qty .. "x " .. (w.name or "") .. " for " .. Money(plan.total)
-    elseif plan then
-        return "Buy " .. (w.name or "item") .. " for " .. Money(plan.price)
     end
     local nextW = list[current % #list + 1]
     return "None under price - check " .. (nextW.name or "next")
@@ -1431,6 +1539,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         end
         capMoney.SetValue(AHWatchDB.capCopper or 0)
         cycleBox:SetChecked(AHWatchDB.cycleList ~= false)
+        autoBox:SetChecked(AHWatchDB.autoSearch ~= false)
         return
     end
     if not AHWatchDB then return end
@@ -1496,6 +1605,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         runtime[a1] = { rows = rows, time = GetTime() }
         if ns.RecordRows then ns.RecordRows(a1, rows, true) end
         if state == "searching" and w then state = "idle"; searchAuto = false end
+        BgResults(a1)
         if forSell and ns.OnSellResults then ns.OnSellResults(a1, rows, true) end
         if w then AutoQuote(w) end
         Update()
@@ -1518,6 +1628,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         runtime[key.itemID] = { rows = rows, time = GetTime() }
         if ns.RecordRows then ns.RecordRows(key.itemID, rows, false) end
         if state == "searching" and w then state = "idle"; searchAuto = false end
+        BgResults(key.itemID)
         if forSell and ns.OnSellResults then ns.OnSellResults(key.itemID, rows, false) end
         Update()
 
@@ -1565,8 +1676,12 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         SetState("idle")
         -- Refresh straight away if you still want more, so the next press is ready to buy
         if w and AHWatchDB.watch[current] == w and not (w.maxQty and (w.bought or 0) >= w.maxQty)
-            and not LimitReached() and Ready() then
-            Search(w, true)
+            and not LimitReached() then
+            if AutoSearchOn() then
+                bgLast = 0   -- the background watcher refreshes it straight away
+            elseif Ready() then
+                Search(w, true)
+            end
         end
 
     elseif e == "COMMODITY_PURCHASE_FAILED" then
