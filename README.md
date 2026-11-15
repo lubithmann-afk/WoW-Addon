@@ -10,7 +10,7 @@ Watch list with one-key buying, "% below market" next to every price, a ledger o
 
 That's it. From then on, every time Windows starts, AHWatch checks this page, installs any newer version, and fixes the game's interface number so it isn't marked "out of date", then closes by itself.
 
-To stop it, double-click **Turn off auto-update** in the same folder.
+To check right away, double-click **Check for updates now** in the same folder. To stop it, double-click **Turn off auto-update**.
 
 ## Releasing a new version
-Bump `## Version:` in `AHWatch/AHWatch.toc` and push to `main`. Everyone's copy updates the next time their PC starts.
+Bump `## Version:` in `AHWatch/AHWatch.toc` and push to `main`. Everyone's copy updates the next time their PC starts (or when they check now).

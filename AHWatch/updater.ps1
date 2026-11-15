@@ -134,7 +134,10 @@ if (-not (Test-Path $TocPath)) {
 # ------------------------------------------------------------- check GitHub
 Log "---- AHWatch auto-update ----" "Cyan"
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-$ua = @{ "User-Agent" = "AHWatch-Updater" }
+$ua = @{ "User-Agent" = "AHWatch-Updater"; "Cache-Control" = "no-cache"; "Pragma" = "no-cache" }
+# GitHub's API serves the current files; the plain raw/archive addresses can be
+# up to 5 minutes behind after an update, so they're only the fallback
+$api = @{ "User-Agent" = "AHWatch-Updater"; "Accept" = "application/vnd.github.raw" }
 
 $installed = Read-TocField $TocPath "Version"
 Log "Installed: $installed"
@@ -142,8 +145,16 @@ Log "Installed: $installed"
 $remoteToc = $null
 for ($try = 1; $try -le 3 -and -not $remoteToc; $try++) {
     try {
-        $remoteToc = (Invoke-WebRequest -UseBasicParsing -Headers $ua -TimeoutSec 20 `
-            -Uri "https://raw.githubusercontent.com/$Repo/$Branch/AHWatch/AHWatch.toc").Content
+        try {
+            $remoteToc = (Invoke-WebRequest -UseBasicParsing -Headers $api -TimeoutSec 20 `
+                -Uri "https://api.github.com/repos/$Repo/contents/AHWatch/AHWatch.toc?ref=$Branch").Content
+            # Windows PowerShell hands this type of reply over as bytes, not text
+            if ($remoteToc -is [byte[]]) { $remoteToc = [Text.Encoding]::UTF8.GetString($remoteToc) }
+            if (-not (Read-TocFieldFromText $remoteToc "Version")) { throw "no version in the reply" }
+        } catch {
+            $remoteToc = (Invoke-WebRequest -UseBasicParsing -Headers $ua -TimeoutSec 20 `
+                -Uri "https://raw.githubusercontent.com/$Repo/$Branch/AHWatch/AHWatch.toc").Content
+        }
     } catch {
         if ($try -lt 3) { Log "Can't reach GitHub yet (try $try of 3), waiting for the network..."; Start-Sleep -Seconds 10 }
         else { Problem "Couldn't reach GitHub: $($_.Exception.Message)" }
@@ -161,14 +172,24 @@ if ($remoteToc) {
         try {
             $zip = Join-Path $work "ahwatch.zip"
             Log "Downloading AHWatch $latest..."
-            Invoke-WebRequest -UseBasicParsing -Headers $ua -TimeoutSec 180 `
-                -Uri "https://github.com/$Repo/archive/refs/heads/$Branch.zip" -OutFile $zip
+            try {
+                Invoke-WebRequest -UseBasicParsing -Headers @{ "User-Agent" = "AHWatch-Updater" } -TimeoutSec 180 `
+                    -Uri "https://api.github.com/repos/$Repo/zipball/$Branch" -OutFile $zip
+            } catch {
+                Invoke-WebRequest -UseBasicParsing -Headers $ua -TimeoutSec 180 `
+                    -Uri "https://github.com/$Repo/archive/refs/heads/$Branch.zip" -OutFile $zip
+            }
             $unz = Join-Path $work "unzipped"
             Expand-Archive -Path $zip -DestinationPath $unz -Force
             $newToc = Get-ChildItem -Path $unz -Recurse -Filter "AHWatch.toc" |
                 Where-Object { $_.Directory.Name -eq "AHWatch" } |
                 Sort-Object { $_.FullName.Length } | Select-Object -First 1
             if (-not $newToc) { throw "the download doesn't contain the AHWatch folder" }
+            # GitHub can serve a slightly old copy for a few minutes after an update: don't install that
+            $gotVersion = Read-TocField $newToc.FullName "Version"
+            if ((To-Version $gotVersion) -le (To-Version $installed)) {
+                throw "GitHub is still sending the old version ($gotVersion) - it'll be picked up next time"
+            }
 
             # Back up the current copy, then swap in the new one (put the old one back if that fails)
             New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
