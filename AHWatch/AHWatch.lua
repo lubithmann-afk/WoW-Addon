@@ -374,7 +374,7 @@ local function Buy(w, plan, auto, manual, second)
         local qty = plan.row.quantity or 1
         spent = spent + plan.price
         w.bought = (w.bought or 0) + qty
-        local p = { auctionID = plan.auctionID, price = plan.price, qty = qty, itemID = w.itemID, name = w.name, w = w,
+        local p = { auctionID = plan.auctionID, price = plan.price, qty = qty, itemID = w.itemID, name = w.name, w = w, t = GetTime(),
             second = second }
         table.insert(pendingBids, p)
         C_Timer.After(BID_TIMEOUT, function()
@@ -561,6 +561,10 @@ local function BackgroundSearch()
         end
     end
     if not CanSearch() then return end   -- search pacing: as fast as the server allows, no faster
+    -- A buyout you just made is still going through: don't put a search in its way (up to 3s)
+    for _, p in ipairs(pendingBids) do
+        if now - (p.t or 0) < 3 then return end
+    end
     local list = AHWatchDB.watch
     if #list == 0 then return end
     -- A deal is waiting: leave the server free so your press buys it at once
