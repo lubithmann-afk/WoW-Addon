@@ -825,6 +825,7 @@ function RefreshQS()
     local function SetGoLabel(label)
         if ns.CurrentTab and ns.CurrentTab() == "quicksell" and _G.AHWatchGoButton then
             local key = (ns.GetKey and ns.GetKey()) or ""
+            if ns.KeyName then key = ns.KeyName(key) end
             _G.AHWatchGoButton:SetText(label .. "  |cff888888(" .. key .. ")|r")
         end
     end

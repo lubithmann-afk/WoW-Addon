@@ -13,10 +13,15 @@ local main = AHWatchFrame
 local Money = ns.Money
 
 local MAX_ENTRIES = 2000
-local ROWS = 15
+local ROWS = 14
 local ROW_H = 18
 
-local function Short(c) return ns.ShortMoney and ns.ShortMoney(c) or Money(c) end
+-- Money with the gold/silver/copper coin icons
+local function Coins(c)
+    c = math.floor((c or 0) + 0.5)
+    if GetMoneyString then return GetMoneyString(c, true) end
+    return Money(c)
+end
 
 local function Entries()
     if type(AHWatchDB) ~= "table" then AHWatchDB = {} end
@@ -96,17 +101,32 @@ local function Text(font, x, y, width, justify)
     return fs
 end
 
--- Totals
-local sumToday = Text("GameFontHighlightSmall", 14, -30, 332)
-local sumWeek  = Text("GameFontHighlightSmall", 14, -45, 332)
-local sumAll   = Text("GameFontHighlightSmall", 14, -60, 332)
-local sumDeal  = Text("GameFontHighlightSmall", 14, -75, 332)
+-- Totals: a small table - Today / 7 days / All against Spent / Earned / Net
+local COLS = { { x = 66, w = 92 }, { x = 160, w = 92 }, { x = 254, w = 92 } }
+do
+    local heads = { "Spent", "Earned", "Net" }
+    for i, c in ipairs(COLS) do Text("GameFontNormalSmall", c.x, -28, c.w, "RIGHT"):SetText(heads[i]) end
+    local line = lf:CreateTexture(nil, "ARTWORK")
+    line:SetColorTexture(1, 1, 1, 0.12)
+    line:SetHeight(1)
+    line:SetPoint("TOPLEFT", lf, "TOPLEFT", 12, -41)
+    line:SetPoint("TOPRIGHT", lf, "TOPRIGHT", -12, -41)
+end
+local sumRows = {}
+for i, label in ipairs({ "Today", "7 days", "All" }) do
+    local y = -45 - (i - 1) * 15
+    local r = { label = Text("GameFontNormalSmall", 14, y, 52) }
+    r.label:SetText(label)
+    for k, c in ipairs(COLS) do r[k] = Text("GameFontHighlightSmall", c.x, y, c.w, "RIGHT") end
+    sumRows[i] = r
+end
+local sumDeal = Text("GameFontHighlightSmall", 14, -92, 332)
 
 -- Filter by name, and which kind to list
-Text("GameFontNormalSmall", 14, -98):SetText("Filter:")
+Text("GameFontNormalSmall", 14, -112):SetText("Filter:")
 local filterBox = CreateFrame("EditBox", nil, lf, "InputBoxTemplate")
 filterBox:SetSize(110, 20)
-filterBox:SetPoint("TOPLEFT", lf, "TOPLEFT", 58, -94)
+filterBox:SetPoint("TOPLEFT", lf, "TOPLEFT", 58, -108)
 filterBox:SetAutoFocus(false)
 filterBox:SetScript("OnEscapePressed", function(self) self:SetText(""); self:ClearFocus() end)
 filterBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
@@ -116,7 +136,7 @@ local viewBtns = {}
 for i, v in ipairs({ { "all", "All" }, { "buy", "Bought" }, { "sale", "Sold" } }) do
     local b = CreateFrame("Button", nil, lf, "UIPanelButtonTemplate")
     b:SetSize(52, 18)
-    b:SetPoint("TOPRIGHT", lf, "TOPRIGHT", -12 - (3 - i) * 54, -95)
+    b:SetPoint("TOPRIGHT", lf, "TOPRIGHT", -12 - (3 - i) * 54, -109)
     b:SetText(v[2])
     b:SetNormalFontObject(GameFontNormalSmall)
     b:SetHighlightFontObject(GameFontHighlightSmall)
@@ -125,7 +145,7 @@ for i, v in ipairs({ { "all", "All" }, { "buy", "Bought" }, { "sale", "Sold" } }
 end
 
 -- Column headings
-local HY = -120
+local HY = -134
 Text("GameFontNormalSmall", 14, HY, 76):SetText("When")
 Text("GameFontNormalSmall", 92, HY, 140):SetText("Item")
 Text("GameFontNormalSmall", 214, HY, 36, "RIGHT"):SetText("Qty")
@@ -256,11 +276,15 @@ clearBtn:SetHighlightFontObject(GameFontHighlightSmall)
 local offset = 0
 local shown = {}   -- entries matching the filter and view, newest first
 
-local function Totals(label, spent, nBuy, earned, nSale)
+local function FillTotals(r, spent, nBuy, earned, nSale)
     local net = earned - spent
-    local netText = (net >= 0) and ("|cff33dd66+" .. Short(net) .. "|r") or ("|cffff6666-" .. Short(-net) .. "|r")
-    return label .. "spent |cffff9999" .. Short(spent) .. "|r (" .. nBuy .. ")   earned |cff99ff99"
-        .. Short(earned) .. "|r (" .. nSale .. ")   net " .. netText
+    r[1]:SetText(spent > 0 and Coins(spent) or "|cff666666-|r")
+    r[2]:SetText(earned > 0 and Coins(earned) or "|cff666666-|r")
+    if net == 0 then
+        r[3]:SetText("|cff666666-|r")
+    else
+        r[3]:SetText((net > 0 and "|cff33dd66+|r" or "|cffff6666-|r") .. Coins(math.abs(net)))
+    end
 end
 
 function Refresh()
@@ -299,15 +323,16 @@ function Refresh()
             if view == "all" or (view == "sale") == isSale then table.insert(shown, e) end
         end
     end
-    sumToday:SetText(Totals("Today:  ", unpack(T.day)))
-    sumWeek:SetText(Totals("7 days:  ", unpack(T.week)))
-    sumAll:SetText(Totals("All:  ", unpack(T.all)))
+    FillTotals(sumRows[1], unpack(T.day))
+    FillTotals(sumRows[2], unpack(T.week))
+    FillTotals(sumRows[3], unpack(T.all))
+    local counts = string.format("|cffaaaaaa%d buy%s, %d sale%s%s|r", T.all[2], T.all[2] == 1 and "" or "s",
+        T.all[4], T.all[4] == 1 and "" or "s", q ~= "" and " (this filter)" or "")
     if dealCount > 0 then
         local deal = DealText(paidWithMarket, marketValue)
-        sumDeal:SetText("Your buys on average: " .. deal .. "  |cffaaaaaa(" .. dealCount .. " with a market price"
-            .. (q ~= "" and ", this filter" or "") .. ")|r")
+        sumDeal:SetText(counts .. "  -  your buys average " .. deal)
     else
-        sumDeal:SetText("|cff888888Your average discount shows here once you've bought something with a market price.|r")
+        sumDeal:SetText(counts)
     end
 
     for _, b in ipairs(viewBtns) do
@@ -324,9 +349,9 @@ function Refresh()
             b.name:SetText(NameOf(e))
             b.qty:SetText((e.q or 1) > 1 and (e.q .. "x") or "1")
             if e.kind == "sale" then
-                b.amount:SetText("|cff99ff99+" .. Short(e.c) .. "|r")
+                b.amount:SetText("|cff33dd66+|r" .. Coins(e.c))
             else
-                b.amount:SetText("|cffff9999-" .. Short(e.c) .. "|r")
+                b.amount:SetText("|cffff6666-|r" .. Coins(e.c))
             end
             b:Show()
         else

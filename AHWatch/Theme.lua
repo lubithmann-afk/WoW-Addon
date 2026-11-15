@@ -321,19 +321,22 @@ local function RefreshButton(b)
     local role = ButtonRole(b)
     local hovered = b:IsMouseOver() and b:IsEnabled()
     if role == "alt" then
+        -- Its own solid button (the game's red button art recoloured came out
+        -- too dark to see on some looks): a gold-to-bronze fill, raised bevel
         local c = ALT[mode] or ALT.classic
-        local k = hovered and 1.2 or 1
+        local k = hovered and 1.15 or 1
         local a = b:IsEnabled() and 1 or 0.5
-        if mode == "trader" then
-            SafeGradient(st.bg, true, { c[1] * 0.78 * k, c[2] * 0.78 * k, c[3] * 0.78 * k, a },
-                { c[1] * 1.28 * k, c[2] * 1.28 * k, c[3] * 1.28 * k, a })
-        else
-            -- Grey out the game's red button art, then colour it
-            for _, p in ipairs(st.parts) do
-                if p.SetDesaturated then p:SetDesaturated(true) end
-                p:SetVertexColor(math.min(1, c[1] * k), math.min(1, c[2] * k), math.min(1, c[3] * k), a)
-            end
+        ShowList(st.parts, false)
+        st.bg:Show()
+        ShowList(st.outline, true)
+        SafeGradient(st.bg, true, { c[1] * 0.42 * k, c[2] * 0.42 * k, c[3] * 0.42 * k, a },
+            { c[1] * 0.78 * k, c[2] * 0.78 * k, c[3] * 0.78 * k, a })
+        if not st.edge then
+            st.edge = Outline(b, { 0, 0, 0, 1 }, 0, "BORDER")
         end
+        for _, l in ipairs(st.edge) do l:SetColorTexture(math.min(1, c[1] * 1.1), math.min(1, c[2] * 1.1), math.min(1, c[3] * 1.1), 0.9) end
+        local hl = b:GetHighlightTexture()
+        if hl then hl:SetAlpha(0) end
         return
     end
     if mode == "trader" then

@@ -1051,6 +1051,12 @@ local titleFS
 if f.TitleText then
     f.TitleText:SetText("AH Watch")
     titleFS = f.TitleText
+    -- Left of the Buy/Sell/Quick Sell tabs (centred, they covered it)
+    titleFS:ClearAllPoints()
+    titleFS:SetPoint("TOPLEFT", f, "TOPLEFT", 76, -5)
+    titleFS:SetWidth(64)
+    titleFS:SetJustifyH("LEFT")
+    titleFS:SetWordWrap(false)
 else
     local bg = CreateFrame("Frame", nil, f, (BackdropTemplateMixin and "BackdropTemplate") or nil)
     bg:SetAllPoints()
@@ -1062,7 +1068,10 @@ else
         insets = { left = 11, right = 12, top = 12, bottom = 11 },
     })
     local t = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    t:SetPoint("TOP", 0, -8)
+    t:SetPoint("TOPLEFT", 76, -8)
+    t:SetWidth(64)
+    t:SetJustifyH("LEFT")
+    t:SetWordWrap(false)
     t:SetText("AH Watch")
     titleFS = t
     local c = CreateFrame("Button", nil, f, "UIPanelCloseButton")
@@ -1246,6 +1255,12 @@ for i = 1, BROWSE_ROWS do
     b:Hide()
     browseRows[i] = b
 end
+-- A hint in the empty results area until something is searched
+local browseHint = f:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+browseHint:SetPoint("TOP", f, "TOP", 0, -112)
+browseHint:SetWidth(300)
+browseHint:SetText("Search for an item, click it, set a max price,\nthen Add to list to watch it.")
+
 -- "7-12 of 20 - scroll for more", next to "Find item:"
 local browseCount = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 browseCount:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -32)
@@ -1544,6 +1559,18 @@ local function GetKey() return (AHWatchDB and AHWatchDB.keybind) or DEFAULT_KEY 
 local function GetManualKey() return (AHWatchDB and AHWatchDB.manualKeybind) or DEFAULT_MANUAL_KEY end
 ns.GetKey = GetKey
 
+-- "MOUSEWHEELDOWN" -> "Wheel down", "SHIFT-BUTTON4" -> "Shift-Mouse 4"
+local KEY_NAMES = { MOUSEWHEELUP = "Wheel up", MOUSEWHEELDOWN = "Wheel down", BUTTON3 = "Middle mouse",
+    BUTTON4 = "Mouse 4", BUTTON5 = "Mouse 5" }
+local function KeyName(key)
+    return (key:gsub("[^%-]+", function(part)
+        if KEY_NAMES[part] then return KEY_NAMES[part] end
+        if part == "SHIFT" or part == "CTRL" or part == "ALT" then return part:sub(1, 1) .. part:sub(2):lower() end
+        return part
+    end))
+end
+ns.KeyName = KeyName
+
 local function ApplyKey()
     ClearOverrideBindings(keyOwner)
     if ahOpen then
@@ -1606,11 +1633,11 @@ local function KeyButtonClick(which, button)
             .. (IsShiftKeyDown() and "SHIFT-" or "") .. key
         local other = (which == "keybind") and GetManualKey() or GetKey()
         if combo == other then
-            Msg(combo .. " is already used by the other button - pick a different one.")
+            Msg(KeyName(combo) .. " is already used by the other button - pick a different one.")
         else
             AHWatchDB[which] = (combo ~= default) and combo or nil
             ApplyKey()
-            Msg(combo .. " now presses " .. label .. " while the auction house is open"
+            Msg(KeyName(combo) .. " now presses " .. label .. " while the auction house is open"
                 .. (key:find("MOUSEWHEEL") and " (the wheel zooms the camera again once it's closed)." or "."))
         end
         StopCapture()
@@ -1654,7 +1681,7 @@ local manualBtn = CreateFrame("Button", "AHWatchManualButton", f, "UIPanelButton
 manualBtn:SetSize(248, 26)
 manualBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 72)
 manualBtn.pbAlt = true     -- its own colour, apart from the big button
-manualBtn:SetNormalFontObject(GameFontNormalSmall)
+manualBtn:SetNormalFontObject(GameFontHighlightSmall)
 manualBtn:SetHighlightFontObject(GameFontHighlightSmall)
 manualBtn:SetDisabledFontObject(GameFontDisableSmall)
 
@@ -1846,10 +1873,10 @@ local function GoText()
         return "BUY " .. (bw.name or "item") .. " for " .. Money(plan.price)
     end
     if SearchPaused() then
-        return string.format("Server asked to slow down - scanning again in %ds", math.ceil(SearchWait()))
+        return string.format("Server pause - scanning in %ds", math.ceil(SearchWait()))
     end
     local n = #list
-    return string.format("Watching %d item%s - nothing yet (1 search / %.1fs)", n, n == 1 and "" or "s", SearchGap())
+    return string.format("Watching %d - nothing yet |cffaaaaaa(%.1fs)|r", n, SearchGap())
 end
 
 -- Used by Flip opportunities (Prices.lua): adds an item to the watch list at
@@ -1890,6 +1917,7 @@ function Update()
     for _, e in ipairs(browse) do e.name = e.name or ItemName(e.itemID) end
     SortBrowse()
     browseOffset = math.max(0, math.min(browseOffset, #browse - BROWSE_ROWS))
+    browseHint:SetShown(#browse == 0)
     if #browse > BROWSE_ROWS then
         browseCount:SetText(string.format("%d-%d of %d - scroll for more", browseOffset + 1,
             math.min(browseOffset + BROWSE_ROWS, #browse), #browse))
@@ -1956,8 +1984,8 @@ function Update()
     if LimitReached() then capText = capText .. " |cffff5555- limit reached|r" end
     spentLabel:SetText("Spent: " .. Money(spent) .. capText)
     if CurrentTab() == "buy" then
-        goBtn:SetText(ManualText() .. "  |cff888888(" .. GetKey() .. ")|r")
-        manualBtn:SetText(GoText() .. "  |cff888888(" .. GetManualKey() .. ")|r")
+        goBtn:SetText(ManualText() .. "  |cff888888(" .. KeyName(GetKey()) .. ")|r")
+        manualBtn:SetText(GoText() .. "  |cff888888(" .. KeyName(GetManualKey()) .. ")|r")
         cancelBtn:SetShown(state == "pricing" or state == "confirm")
     end
     ledgerBtn:SetShown(not cancelBtn:IsShown())
@@ -1969,8 +1997,8 @@ function Update()
         addBtn:SetEnabled(selectedBrowse ~= nil)
     end
     if ns.CheckDealAlert then ns.CheckDealAlert() end
-    bindBtn:SetText(capturing == "keybind" and "Press a key..." or ("Key: " .. GetKey()))
-    manualKeyBtn:SetText(capturing == "manualKeybind" and "Press a key..." or ("Key: " .. GetManualKey()))
+    bindBtn:SetText(capturing == "keybind" and "Press a key..." or ("Key: " .. KeyName(GetKey())))
+    manualKeyBtn:SetText(capturing == "manualKeybind" and "Press..." or KeyName(GetManualKey()))
 
     ThemeLabel()
 
@@ -2164,6 +2192,15 @@ for _, b in ipairs(watchRows) do
 end
 
 goBtn:SetScript("OnClick", Go)
+
+-- Keep each button's text inside the button (long text ends in "...")
+for _, b in ipairs({ goBtn, manualBtn, manualKeyBtn, bindBtn }) do
+    local fs = b:GetFontString()
+    if fs then
+        fs:SetWidth(b:GetWidth() - 14)
+        fs:SetWordWrap(false)
+    end
+end
 
 -- Keep a lined-up price fresh: listings come and go, and a press on a price
 -- that's a few seconds old is what fails. It's checked again once it's
