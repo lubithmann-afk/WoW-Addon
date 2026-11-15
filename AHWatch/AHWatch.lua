@@ -252,6 +252,8 @@ local function IsBadListing(auctionID)
     return t and GetTime() - t < BAD_FOR
 end
 
+local IsContested   -- (learning, further down)
+
 local function Plan(w)
     local r = runtime[w.itemID]
     if not r or not r.rows then return nil end
@@ -268,6 +270,7 @@ local function Plan(w)
 
     if w.isCommodity then
         local qty, total, stopped = 0, 0, false
+        local contested = IsContested and IsContested(w.itemID)
         for _, row in ipairs(r.rows) do
             if row.unitPrice > max then break end
             if not row.own then
@@ -281,6 +284,9 @@ local function Plan(w)
                         total = total + take * row.unitPrice
                     end
                     if take < row.quantity or qty >= want then stopped = true end
+                    -- Contested item: one listing per press - a smaller buy is less likely
+                    -- to be beaten by someone taking part of it first
+                    if qty > 0 and contested then stopped = true end
                 end
             end
         end
@@ -444,6 +450,15 @@ end
 local function AvgLife(itemID)
     local x = AHWatchDB.learn and AHWatchDB.learn[itemID]
     if x and x.lifeN >= 2 then return x.lifeSum / x.lifeN end
+end
+-- Contested: its deals usually vanish within 6s, or you lose 30%+ of races on it
+function IsContested(itemID)
+    local x = AHWatchDB.learn and AHWatchDB.learn[itemID]
+    if not x then return false end
+    local life = AvgLife(itemID)
+    if life and life < 6 then return true end
+    local races = x.bought + x.lost
+    return races >= 3 and x.lost / races >= 0.3
 end
 local function QuoteFresh(itemID)
     local life = AvgLife(itemID)
@@ -837,7 +852,7 @@ local function BackgroundSearch()
 end
 -- Being told to slow down isn't the client ignoring background searches
 bgMissesReset = function() bgMisses, bgPending = 0, nil end
-C_Timer.NewTicker(0.3, BackgroundSearch)
+C_Timer.NewTicker(0.03, BackgroundSearch)   -- (cheap checks; the search itself is paced)
 
 local function BgResults(itemID)
     if bgPending and bgPending.itemID == itemID then
@@ -847,7 +862,9 @@ local function BgResults(itemID)
 end
 
 -- The one button on the Buy tab: refresh, buy, confirm, or move to the next item
+local lastPressAt = 0   -- when either buy button was last pressed
 local function BuyGo()
+    lastPressAt = GetTime()
     EnsureDB()
     local list = AHWatchDB.watch
     if not ahOpen then Msg("open the auction house first.") return end
@@ -1271,9 +1288,11 @@ pctBox:SetPoint("TOPLEFT", f, "TOPLEFT", 44, -242)
 pctBox:SetAutoFocus(false)
 pctBox:SetNumeric(true)
 pctBox:SetMaxLetters(3)
-local pctLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-pctLabel:SetPoint("LEFT", pctBox, "RIGHT", 4, 0)
-pctLabel:SetText("% market")
+do
+    local pctLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    pctLabel:SetPoint("LEFT", pctBox, "RIGHT", 4, 0)
+    pctLabel:SetText("% market")
+end
 pctBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 
 -- How many to buy in total (0 = as many as fit your price and limit)
@@ -1311,9 +1330,11 @@ qtyBox:SetScript("OnMouseWheel", function(_, delta) QtyStep(delta > 0 and 1 or -
 qtyBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 qtyBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
 qtyBox:SetScript("OnEditFocusGained", function(self) self:HighlightText() end)
-local qtyLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-qtyLabel:SetPoint("LEFT", qtyBox, "RIGHT", 20, 0)
-qtyLabel:SetText("total  (0=any)")
+do
+    local qtyLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    qtyLabel:SetPoint("LEFT", qtyBox, "RIGHT", 20, 0)
+    qtyLabel:SetText("total  (0=any)")
+end
 
 local addBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
 addBtn:SetSize(110, 22)
@@ -1329,9 +1350,11 @@ Label("Watch list:", 14, -300)
 local cycleBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
 cycleBox:SetSize(20, 20)
 cycleBox:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -298)
-local cycleLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-cycleLabel:SetPoint("RIGHT", cycleBox, "LEFT", -2, 0)
-cycleLabel:SetText("Cycle list")
+do
+    local cycleLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    cycleLabel:SetPoint("RIGHT", cycleBox, "LEFT", -2, 0)
+    cycleLabel:SetText("Cycle list")
+end
 cycleBox:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
     GameTooltip:AddLine("Cycle list", 1, 1, 1)
@@ -1350,9 +1373,11 @@ end)
 local twoBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
 twoBox:SetSize(20, 20)
 twoBox:SetPoint("TOPLEFT", f, "TOPLEFT", 158, -298)
-local twoLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-twoLabel:SetPoint("LEFT", twoBox, "RIGHT", 2, 0)
-twoLabel:SetText("2 per press")
+do
+    local twoLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    twoLabel:SetPoint("LEFT", twoBox, "RIGHT", 2, 0)
+    twoLabel:SetText("2 per press")
+end
 twoBox:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
     GameTooltip:AddLine("2 per press", 1, 1, 1)
@@ -1373,9 +1398,11 @@ end)
 local autoBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
 autoBox:SetSize(20, 20)
 autoBox:SetPoint("TOPLEFT", f, "TOPLEFT", 84, -298)
-local autoLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-autoLabel:SetPoint("LEFT", autoBox, "RIGHT", 2, 0)
-autoLabel:SetText("Watch all")
+do
+    local autoLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    autoLabel:SetPoint("LEFT", autoBox, "RIGHT", 2, 0)
+    autoLabel:SetText("Watch all")
+end
 autoBox:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
     GameTooltip:AddLine("Watch all", 1, 1, 1)
@@ -1527,16 +1554,42 @@ local function ApplyKey()
     end
 end
 
+-- While a key is being set, a see-through layer over the whole screen
+-- catches the next key, mouse-wheel notch or side mouse button. The wheel
+-- is the fastest way to press: every notch is a real press, so scrolling
+-- presses far faster than tapping a key.
+local catcher = CreateFrame("Frame", nil, UIParent)
+catcher:SetAllPoints(UIParent)
+catcher:SetFrameStrata("FULLSCREEN_DIALOG")
+catcher:EnableMouse(true)
+catcher:Hide()
+do
+    local catcherBg = catcher:CreateTexture(nil, "BACKGROUND")
+    catcherBg:SetAllPoints()
+    catcherBg:SetColorTexture(0, 0, 0, 0.35)
+end
+do
+    local catcherText = catcher:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
+    catcherText:SetPoint("CENTER")
+    catcherText:SetText("Press a key, scroll the mouse wheel, or click a side mouse button\n(Escape cancels)")
+end
+
 local function StopCapture()
     capturing = nil
-    f:SetScript("OnKeyDown", nil)
-    f:EnableKeyboard(false)
+    catcher:SetScript("OnKeyDown", nil)
+    catcher:SetScript("OnMouseWheel", nil)
+    catcher:SetScript("OnMouseDown", nil)
+    catcher:EnableKeyboard(false)
+    catcher:EnableMouseWheel(false)
+    catcher:Hide()
     Update()
 end
 
 local IGNORE_KEYS = { LSHIFT = true, RSHIFT = true, LCTRL = true, RCTRL = true, LALT = true, RALT = true, UNKNOWN = true }
+local MOUSE_KEYS = { MiddleButton = "BUTTON3", Button4 = "BUTTON4", Button5 = "BUTTON5" }
 
--- Left-click a key button, then press a key; right-click puts it back to the default
+-- Left-click a key button, then press a key (or scroll / side button);
+-- right-click puts it back to the default
 local function KeyButtonClick(which, button)
     local default = (which == "keybind") and DEFAULT_KEY or DEFAULT_MANUAL_KEY
     local label = (which == "keybind") and "the big button" or "Buy instantly"
@@ -1548,23 +1601,32 @@ local function KeyButtonClick(which, button)
     end
     if capturing then StopCapture() return end
     capturing = which
-    f:EnableKeyboard(true)
-    f:SetPropagateKeyboardInput(false)
-    f:SetScript("OnKeyDown", function(_, key)
-        if IGNORE_KEYS[key] then return end
-        if key ~= "ESCAPE" then
-            local combo = (IsAltKeyDown() and "ALT-" or "") .. (IsControlKeyDown() and "CTRL-" or "")
-                .. (IsShiftKeyDown() and "SHIFT-" or "") .. key
-            local other = (which == "keybind") and GetManualKey() or GetKey()
-            if combo == other then
-                Msg(combo .. " is already used by the other button - pick a different key.")
-            else
-                AHWatchDB[which] = (combo ~= default) and combo or nil
-                ApplyKey()
-                Msg(combo .. " now presses " .. label .. " while the auction house is open.")
-            end
+    local function Take(key)
+        local combo = (IsAltKeyDown() and "ALT-" or "") .. (IsControlKeyDown() and "CTRL-" or "")
+            .. (IsShiftKeyDown() and "SHIFT-" or "") .. key
+        local other = (which == "keybind") and GetManualKey() or GetKey()
+        if combo == other then
+            Msg(combo .. " is already used by the other button - pick a different one.")
+        else
+            AHWatchDB[which] = (combo ~= default) and combo or nil
+            ApplyKey()
+            Msg(combo .. " now presses " .. label .. " while the auction house is open"
+                .. (key:find("MOUSEWHEEL") and " (the wheel zooms the camera again once it's closed)." or "."))
         end
         StopCapture()
+    end
+    catcher:Show()
+    catcher:EnableKeyboard(true)
+    catcher:SetPropagateKeyboardInput(false)
+    catcher:EnableMouseWheel(true)
+    catcher:SetScript("OnKeyDown", function(_, key)
+        if IGNORE_KEYS[key] then return end
+        if key == "ESCAPE" then StopCapture() return end
+        Take(key)
+    end)
+    catcher:SetScript("OnMouseWheel", function(_, delta) Take(delta > 0 and "MOUSEWHEELUP" or "MOUSEWHEELDOWN") end)
+    catcher:SetScript("OnMouseDown", function(_, btn)
+        if MOUSE_KEYS[btn] then Take(MOUSE_KEYS[btn]) end   -- left/right clicks are left alone
     end)
     Update()
 end
@@ -1663,6 +1725,7 @@ function ManualQuote()
 end
 
 function ManualGo()
+    lastPressAt = GetTime()
     EnsureDB()
     if not ahOpen then Msg("open the auction house first.") return end
     local w, why = ManualTarget()
@@ -2109,6 +2172,8 @@ goBtn:SetScript("OnClick", Go)
 C_Timer.NewTicker(0.25, function()
     if state ~= "confirm" or not purchase or not ahOpen then return end
     if GetTime() - (purchase.quotedAt or 0) < QuoteFresh(purchase.itemID) or not CanSearch() then return end
+    -- You're pressing: your next press buys it anyway, so don't put a refresh in the way
+    if GetTime() - lastPressAt < 1 then return end
     NoteSearch()
     pcall(C_AuctionHouse.CancelCommoditiesPurchase)
     purchase.auto, purchase.total = true, nil
