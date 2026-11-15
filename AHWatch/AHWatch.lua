@@ -324,6 +324,126 @@ local function Search(w, auto)
     return true
 end
 
+------------------------------------------------------------
+-- Learning: per item, how often deals (listings at or under your max)
+-- show up, at what hours, how long they last before someone else takes
+-- them, and how often you get them, miss them, or lose the race. Saved
+-- between sessions. Used to buy the most contested deal first, and shown
+-- by /ahw stats and on the watch list's tooltips.
+------------------------------------------------------------
+
+local dealOpen = {}             -- itemID -> { t = when it appeared, bought = got some of it }
+local dealAlertAt = nil         -- when the deal alert went off (to time your press)
+
+local function Learn(itemID)
+    AHWatchDB.learn = AHWatchDB.learn or {}
+    local x = AHWatchDB.learn[itemID]
+    if not x then
+        x = { seen = 0, bought = 0, missed = 0, lost = 0, lifeSum = 0, lifeN = 0, hours = {} }
+        AHWatchDB.learn[itemID] = x
+    end
+    return x
+end
+
+local function DealOpened(itemID)
+    if dealOpen[itemID] then return end
+    dealOpen[itemID] = { t = GetTime() }
+    local x = Learn(itemID)
+    x.seen = x.seen + 1
+    local h = date("*t").hour + 1   -- 1-24, so it saves as a plain list
+    x.hours[h] = (x.hours[h] or 0) + 1
+end
+
+-- The deal is gone. If you didn't get any of it, someone else did (or the
+-- seller pulled it): count it as missed and note how long it lasted.
+local function DealClosed(itemID)
+    local d = dealOpen[itemID]
+    if not d then return end
+    dealOpen[itemID] = nil
+    if d.bought then return end
+    local x = Learn(itemID)
+    x.missed = x.missed + 1
+    local life = GetTime() - d.t
+    if life < 600 then x.lifeSum, x.lifeN = x.lifeSum + life, x.lifeN + 1 end
+end
+
+local function DealBought(itemID)
+    local x = Learn(itemID)
+    x.bought = x.bought + 1
+    if dealOpen[itemID] then dealOpen[itemID].bought = true end
+end
+
+-- You pressed, but someone else got there first
+local function DealLost(itemID)
+    if not itemID then return end
+    local x = Learn(itemID)
+    x.lost = x.lost + 1
+end
+
+-- New results for a watched item: is there a deal on it right now?
+local function TrackDeal(w)
+    local _, sm = Plan(w)
+    if sm and (sm.under or 0) > 0 then DealOpened(w.itemID) else DealClosed(w.itemID) end
+end
+
+-- Lower = more contested (deals vanish fast, races get lost): bought first
+local function ContestScore(itemID)
+    local x = AHWatchDB.learn and AHWatchDB.learn[itemID]
+    if not x or x.lifeN < 2 then return 60 end
+    local lostShare = x.lost / math.max(1, x.bought + x.lost)
+    return x.lifeSum / x.lifeN - lostShare * 10
+end
+
+local function NoteReaction()
+    if not dealAlertAt then return end
+    local rt = GetTime() - dealAlertAt
+    dealAlertAt = nil
+    if rt > 30 then return end   -- you weren't at the keyboard; don't count it
+    AHWatchDB.react = AHWatchDB.react or { sum = 0, n = 0 }
+    AHWatchDB.react.sum, AHWatchDB.react.n = AHWatchDB.react.sum + rt, AHWatchDB.react.n + 1
+end
+
+local function HourText(h)   -- 1-24 -> "7pm"
+    local hr = h - 1
+    if hr == 0 then return "12am" elseif hr < 12 then return hr .. "am" elseif hr == 12 then return "12pm" end
+    return (hr - 12) .. "pm"
+end
+
+local function BestHours(x)
+    local list = {}
+    for h = 1, 24 do
+        if (x.hours[h] or 0) >= 2 then list[#list + 1] = { h = h, n = x.hours[h] } end
+    end
+    table.sort(list, function(a, b) return a.n > b.n end)
+    local out = {}
+    for i = 1, math.min(3, #list) do out[i] = HourText(list[i].h) end
+    return out
+end
+
+-- Short summary + advice for one item (tooltip and /ahw stats)
+local function LearnLines(itemID)
+    local x = AHWatchDB.learn and AHWatchDB.learn[itemID]
+    if not x or x.seen == 0 then return { "No deals seen yet." } end
+    local lines = {}
+    lines[#lines + 1] = string.format("Deals seen: %d   bought: %d   missed: %d   lost races: %d",
+        x.seen, x.bought, x.missed, x.lost)
+    if x.lifeN > 0 then
+        local life = x.lifeSum / x.lifeN
+        lines[#lines + 1] = string.format("Deals you missed lasted about %.1fs%s", life,
+            life < 3 and " - very contested" or (life < 10 and " - contested" or ""))
+    end
+    local best = BestHours(x)
+    if #best > 0 then lines[#lines + 1] = "Deals mostly show up around " .. table.concat(best, ", ") end
+    local races = x.bought + x.lost
+    if x.lost >= 3 and x.lost / math.max(1, races) > 0.3 then
+        lines[#lines + 1] = "|cffffd100Losing races here: raise your max a little, or give it your fastest key.|r"
+    elseif x.missed >= 5 and x.missed > x.bought * 2 then
+        lines[#lines + 1] = "|cffffd100Most deals are gone before you press: keep a finger on the Buy instantly key.|r"
+    end
+    return lines
+end
+ns.LearnLines = LearnLines
+
 -- A buyout the server never confirmed: take it back off the spent/bought counts
 local function FailBid(p)
     for i, q in ipairs(pendingBids) do
@@ -332,6 +452,7 @@ local function FailBid(p)
     spent = math.max(0, spent - p.price)
     if p.w then p.w.bought = math.max(0, (p.w.bought or 0) - p.qty) end
     if (p.w and p.w.bought) == 0 then p.w.bought = nil end
+    if not p.second then DealLost(p.itemID) end
     if p.second then
         Msg("the second buy on that press (" .. (p.name or "item") .. ") didn't go through - if this keeps "
             .. "happening, your server allows only one buy per press: untick \"2 per press\".")
@@ -345,6 +466,7 @@ local function ConfirmBid(i)
     local p = table.remove(pendingBids, i)
     if not p then return end
     if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.price) end
+    DealBought(p.itemID)
     local qtyText = p.qty > 1 and (p.qty .. "x ") or ""
     Msg("bought " .. qtyText .. (p.name or "item") .. " for " .. Money(p.price) .. ".")
 end
@@ -431,15 +553,22 @@ local function NextPlan()
     local n = #list
     if n == 0 or LimitReached() then return nil end
     if current > n then current = 1 end
+    -- Several deals at once: the most contested one first (it'll be gone
+    -- soonest); the others are likelier to still be there next press
+    local bestW, bestPlan, bestI, bestScore
     for k = 0, n - 1 do
         local i = (current - 1 + k) % n + 1
         local w = list[i]
         local r = runtime[w.itemID]
         if r and r.rows and GetTime() - r.time <= STALE_AFTER then
             local plan = Plan(w)
-            if plan then return w, plan, i end
+            if plan then
+                local sc = ContestScore(w.itemID)
+                if not bestW or sc < bestScore then bestW, bestPlan, bestI, bestScore = w, plan, i, sc end
+            end
         end
     end
+    return bestW, bestPlan, bestI
 end
 
 -- Get a commodity's price ready ahead of time, so the next press buys it
@@ -524,10 +653,14 @@ local function FavoritesResults()
             seen[id] = true
             local max = MaxPriceFor(w)
             local want = not (w.maxQty and w.maxQty > 0 and (w.bought or 0) >= w.maxQty)
-            if max and want and res.minPrice <= max then MarkHot(id) end
+            if max and want and res.minPrice <= max then MarkHot(id) else DealClosed(id) end
         end
     end
-    -- A watched item missing from the results (not listed right now) needs no search
+    -- A watched item missing from the results isn't listed right now
+    for id in pairs(dealOpen) do
+        if not seen[id] and FindWatch(id) then DealClosed(id) end
+    end
+    table.sort(hotOrder, function(a, b) return ContestScore(a) < ContestScore(b) end)
     return seen
 end
 
@@ -567,8 +700,19 @@ local function BackgroundSearch()
     end
     local list = AHWatchDB.watch
     if #list == 0 then return end
-    -- A deal is waiting: leave the server free so your press buys it at once
-    if NextPlan() then return end
+    -- A deal is waiting: leave the server free so your press buys it at once -
+    -- just re-check that one item every few seconds, so a deal someone else
+    -- took isn't still offered (and to learn how long its deals last)
+    local dw = NextPlan()
+    if dw then
+        local r = runtime[dw.itemID]
+        if r and now - r.time < math.max(3, SearchGap() * 2) then return end
+        NoteSearch()
+        local ok = pcall(C_AuctionHouse.SendSearchQuery, WatchKey(dw), { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
+        bgLast = now
+        if ok then bgPending = { itemID = dw.itemID, t = now } end
+        return
+    end
     -- 1) Items the favorites search showed at or under your price: full search, first in line
     while #hotOrder > 0 do
         local id = table.remove(hotOrder, 1)
@@ -624,7 +768,7 @@ local function BuyGo()
     local list = AHWatchDB.watch
     if not ahOpen then Msg("open the auction house first.") return end
     if #list == 0 then Msg("add an item to your watch list first.") return end
-    if state == "confirm" then ConfirmBuy() return end   -- a deal is lined up: buy it
+    if state == "confirm" then NoteReaction(); ConfirmBuy() return end   -- a deal is lined up: buy it
     if state ~= "idle" and lastSource == "manual" then return end   -- the big button is mid-search
     -- An automatic step the game may have ignored: this press sends it for real
     if state == "pricing" and purchase and purchase.auto then
@@ -644,6 +788,7 @@ local function BuyGo()
     -- Anything on the list at or under its price right now: buy it on this press
     local bw, plan, i = NextPlan()
     if bw then
+        NoteReaction()
         lastSource = "watch"
         current = i
         if Buy(bw, plan) and plan.kind == "item" and TwoPerPress() then
@@ -1826,6 +1971,16 @@ addBtn:SetScript("OnClick", AddSelected)
 pctBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); AddSelected() end)
 
 for _, b in ipairs(watchRows) do
+    b:SetScript("OnEnter", function(self)
+        local w = AHWatchDB.watch[self.index]
+        if not w then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText(w.name or ItemName(w.itemID) or "Item")
+        GameTooltip:AddLine("What AH Watch has learned:", 0.6, 0.8, 1)
+        for _, line in ipairs(LearnLines(w.itemID)) do GameTooltip:AddLine(line, 1, 1, 1, true) end
+        GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", function() GameTooltip:Hide() end)
     b:SetScript("OnClick", function(self)
         current = self.index
         local w = AHWatchDB.watch[self.index]
@@ -1880,6 +2035,7 @@ function ns.CheckDealAlert()
     local ready = DealReady()
     if ready and not dealAlerted then
         dealAlerted = true
+        dealAlertAt = GetTime()
         if AHWatchDB.dealAlert ~= false then
             local sound = (SOUNDKIT and (SOUNDKIT.RAID_WARNING or SOUNDKIT.READY_CHECK)) or 8959
             pcall(PlaySound, sound, "Master")
@@ -1888,6 +2044,7 @@ function ns.CheckDealAlert()
         end
     elseif not ready and dealAlerted then
         dealAlerted = false
+        dealAlertAt = nil
         pulse:Hide()
         manualBtn:SetAlpha(1)
     end
@@ -1910,6 +2067,7 @@ SlashCmdList["AHWATCH"] = function(msg)
     local ml = (msg or ""):match("^%s*minlisted%s*(%S*)")
     local sg = (msg or ""):match("^%s*searchgap%s*(%S*)")
     local isAlert = (msg or ""):match("^%s*alert%s*$")
+    local stats = (msg or ""):match("^%s*stats%s*(%S*)")
     local ma = (msg or ""):match("^%s*avgqty%s*(%S*)")
     if (msg or ""):match("^%s*data%s*$") and ns.PrintData then
         ns.PrintData()
@@ -1917,6 +2075,27 @@ SlashCmdList["AHWATCH"] = function(msg)
         ns.ToggleLedger()
     elseif mb and ns.SetLimit then
         ns.SetLimit(mb)
+    elseif stats then
+        EnsureDB()
+        if stats == "reset" then
+            AHWatchDB.learn, AHWatchDB.react = nil, nil
+            Msg("learned stats cleared.")
+            return
+        end
+        Msg("what AH Watch has learned (/ahw stats reset to start over):")
+        local any = false
+        for _, w in ipairs(AHWatchDB.watch) do
+            any = true
+            print("  |cffffd100" .. (w.name or ItemName(w.itemID) or ("Item " .. w.itemID)) .. "|r")
+            for _, line in ipairs(LearnLines(w.itemID)) do print("    " .. line) end
+        end
+        if not any then print("  (your watch list is empty)") end
+        local r = AHWatchDB.react
+        if r and r.n > 0 then
+            print(string.format("  Your reaction: %.2fs on average from the alert to your press (%d presses)", r.sum / r.n, r.n))
+        else
+            print("  Your reaction: not measured yet (it's timed from the deal alert to your Buy instantly press)")
+        end
     elseif isAlert then
         EnsureDB()
         AHWatchDB.dealAlert = (AHWatchDB.dealAlert == false)
@@ -2044,6 +2223,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         purchase = nil
         state = "idle"
         lastSource = "watch"
+        dealOpen = {}   -- deals can't be watched while it's closed
         runtime = {}
         ApplyKey()
         f:Hide()
@@ -2093,6 +2273,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
         BgResults(a1)
         if forSell and ns.OnSellResults then ns.OnSellResults(a1, rows, true) end
+        if w then TrackDeal(w) end
         if isManual and lastSource == "manual" then ManualQuote() elseif w then AutoQuote(w) end
         Update()
 
@@ -2119,6 +2300,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
         BgResults(key.itemID)
         if forSell and ns.OnSellResults then ns.OnSellResults(key.itemID, rows, false) end
+        if w then TrackDeal(w) end
         Update()
 
     elseif e == "COMMODITY_PRICE_UPDATED" then
@@ -2139,6 +2321,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         end
 
     elseif e == "COMMODITY_PRICE_UNAVAILABLE" then
+        if purchase and not purchase.auto then DealLost(purchase.itemID) end
         if purchase then runtime[purchase.itemID] = nil end
         Msg("those listings are gone - press again to refresh.")
         purchase = nil
@@ -2154,6 +2337,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
             w = p.w or FindWatch(p.itemID)
             if w then w.bought = (w.bought or 0) + p.qty end
             if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.total or 0) end
+            DealBought(p.itemID)
             Msg("bought " .. p.qty .. "x " .. (p.name or "item") .. " for " .. Money(p.total or 0) .. ".")
             runtime[p.itemID] = nil
         end
@@ -2175,6 +2359,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
 
     elseif e == "COMMODITY_PURCHASE_FAILED" then
         latePurchase = nil
+        if purchase then DealLost(purchase.itemID) end
         if purchase then runtime[purchase.itemID] = nil end
         Msg("purchase failed - press again to refresh.")
         purchase = nil
