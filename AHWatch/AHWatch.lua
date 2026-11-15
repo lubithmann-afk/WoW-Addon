@@ -30,7 +30,6 @@ local browsePendingAt = 0       -- when it went out (a search that never answers
 local searchAuto = false        -- the search in progress was started by the addon, not a press
 local pendingBids = {}          -- item buyouts sent, waiting for the server to confirm
 local lastMoney = nil           -- gold last seen, to spot a buyout going through
-local BID_TIMEOUT = 8           -- seconds before an unconfirmed buyout counts as failed
 local itemInfoQueued = false
 local manualW = nil             -- the watch-list item the Search & buy button works on
 local selectedWatchID = nil     -- the watch-list item you clicked (Search & buy's target)
@@ -149,7 +148,39 @@ local function SearchWait()
 end
 local function SearchPaused() return GetTime() < pauseUntil end
 local function CanSearch() return SearchWait() <= 0 and Ready() end
-local function NoteSearch() lastSearchAt = GetTime() end
+------------------------------------------------------------
+-- Response times: how long searches, price checks and purchases actually
+-- take on this server (a running average, saved). Waits for an answer are
+-- about 3x that, within sensible limits - so on a quick server a step
+-- that's hung is given up on fast instead of after a fixed long wait.
+------------------------------------------------------------
+
+local sentAt = {}
+local WAIT_LIMITS = { search = { 1.5, 6 }, quote = { 1.5, 3 }, buy = { 2, 5 }, bid = { 3, 8 } }
+
+local function NoteLatency(kind, secs)
+    if not secs or secs <= 0 or secs > 15 then return end
+    AHWatchDB.lat = AHWatchDB.lat or {}
+    local old = AHWatchDB.lat[kind]
+    AHWatchDB.lat[kind] = old and (old * 0.8 + secs * 0.2) or secs
+end
+local function Sent(kind) sentAt[kind] = GetTime() end
+local function Answered(kind)
+    local t = sentAt[kind]
+    sentAt[kind] = nil
+    if t then NoteLatency(kind, GetTime() - t) end
+end
+local function WaitFor(kind)
+    local lim = WAIT_LIMITS[kind]
+    local l = AHWatchDB and AHWatchDB.lat and AHWatchDB.lat[kind]
+    if not l then return lim[2] end
+    return math.max(lim[1], math.min(lim[2], l * 3 + 0.5))
+end
+
+local function NoteSearch()
+    lastSearchAt = GetTime()
+    Sent("search")
+end
 
 local bgMissesReset   -- set by the background watcher, further down
 
@@ -171,10 +202,11 @@ end
 
 -- An answer came back fine: after a long run of them, speed up a little
 local function SearchAnswered()
+    Answered("search")
     goodStreak = goodStreak + 1
-    if goodStreak < 30 then return end
+    if goodStreak < 20 then return end
     goodStreak = 0
-    local floor = math.max(MIN_GAP, AHWatchDB.searchFloor or 1.0)
+    local floor = math.max(MIN_GAP, AHWatchDB.searchFloor or MIN_GAP)
     local g = SearchGap()
     if g > floor then AHWatchDB.searchGap = math.max(floor, g * 0.9) end
 end
@@ -199,6 +231,11 @@ local function FindWatch(itemID)
 end
 
 local SORT_PRICE = (Enum and Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price) or 0
+
+local function StartQuote(itemID, qty)
+    Sent("quote")
+    return pcall(C_AuctionHouse.StartCommoditiesPurchase, itemID, qty)
+end
 
 ------------------------------------------------------------
 -- Planning: what the next press should buy
@@ -335,7 +372,7 @@ local function Search(w, auto)
         SetState("idle")
         return false
     end
-    Timeout("searching", math.max(6, SearchGap() + 4))
+    Timeout("searching", WaitFor("search"))
     return true
 end
 
@@ -402,6 +439,21 @@ local function TrackDeal(w)
 end
 
 -- Lower = more contested (deals vanish fast, races get lost): bought first
+-- How often to refresh a waiting deal / lined-up price for this item: half
+-- as long as its deals usually last (1.5-4s); unknown items get the slow end
+local function AvgLife(itemID)
+    local x = AHWatchDB.learn and AHWatchDB.learn[itemID]
+    if x and x.lifeN >= 2 then return x.lifeSum / x.lifeN end
+end
+local function QuoteFresh(itemID)
+    local life = AvgLife(itemID)
+    return life and math.max(1.5, math.min(4, life * 0.5)) or 4
+end
+local function RecheckEvery(itemID)
+    local life = AvgLife(itemID)
+    return life and math.max(1.5, math.min(3, life * 0.5)) or 3
+end
+
 local function ContestScore(itemID)
     local x = AHWatchDB.learn and AHWatchDB.learn[itemID]
     if not x or x.lifeN < 2 then return 60 end
@@ -472,8 +524,16 @@ local function FailBid(p)
         badAuctions[p.auctionID] = GetTime()
     end
     if p.second then
-        Msg("the second buy on that press (" .. (p.name or "item") .. ") didn't go through - if this keeps "
-            .. "happening, your server allows only one buy per press: untick \"2 per press\".")
+        -- Second buys failing over and over, never once working: this server
+        -- allows one buy per press. Switch it off by itself.
+        local sb = AHWatchDB.secondBuys or { ok = 0, fail = 0 }
+        AHWatchDB.secondBuys = sb
+        sb.fail = sb.fail + 1
+        if sb.fail >= 3 and sb.ok == 0 and AHWatchDB.twoPerPress ~= false then
+            AHWatchDB.twoPerPress = false
+            if ns.SetTwoBox then ns.SetTwoBox(false) end
+            Msg("your server only allows one buy per press, so \"2 per press\" is now off (tick it to try again).")
+        end
     else
         Msg((p.name or "that item") .. " didn't go through (someone else may have bought it first).")
     end
@@ -483,6 +543,11 @@ end
 local function ConfirmBid(i)
     local p = table.remove(pendingBids, i)
     if not p then return end
+    NoteLatency("bid", GetTime() - (p.t or GetTime()))
+    if p.second then
+        AHWatchDB.secondBuys = AHWatchDB.secondBuys or { ok = 0, fail = 0 }
+        AHWatchDB.secondBuys.ok = AHWatchDB.secondBuys.ok + 1
+    end
     if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.price) end
     DealBought(p.itemID)
     local qtyText = p.qty > 1 and (p.qty .. "x ") or ""
@@ -494,14 +559,14 @@ local function Buy(w, plan, auto, manual, second)
         purchase = { itemID = w.itemID, qty = plan.qty, max = MaxPriceFor(w), name = w.name, expected = plan.total,
             auto = auto, w = w, manual = manual }
         SetState("pricing")
-        local ok, err = pcall(C_AuctionHouse.StartCommoditiesPurchase, w.itemID, plan.qty)
+        local ok, err = StartQuote(w.itemID, plan.qty)
         if not ok then
             if not auto then Msg("couldn't start the purchase: " .. tostring(err)) end
             purchase = nil
             SetState("idle")
             return false
         end
-        Timeout("pricing", 3)
+        Timeout("pricing", WaitFor("quote"))
         return true
     else
         local ok, err = pcall(C_AuctionHouse.PlaceBid, plan.auctionID, plan.price)
@@ -517,7 +582,7 @@ local function Buy(w, plan, auto, manual, second)
         local p = { auctionID = plan.auctionID, price = plan.price, qty = qty, itemID = w.itemID, name = w.name, w = w, t = GetTime(),
             second = second }
         table.insert(pendingBids, p)
-        C_Timer.After(BID_TIMEOUT, function()
+        C_Timer.After(WaitFor("bid"), function()
             for _, q in ipairs(pendingBids) do
                 if q == p then FailBid(p) return end
             end
@@ -541,6 +606,7 @@ local function TwoPerPress() return AHWatchDB and AHWatchDB.twoPerPress ~= false
 
 local function ConfirmBuy()
     if not purchase then SetState("idle") return end
+    Sent("buy")
     local ok, err = pcall(C_AuctionHouse.ConfirmCommoditiesPurchase, purchase.itemID, purchase.qty)
     if not ok then
         Msg("couldn't confirm: " .. tostring(err))
@@ -549,7 +615,7 @@ local function ConfirmBuy()
         return
     end
     SetState("buying")
-    Timeout("buying", 5)   -- a purchase that goes through later still counts (latePurchase)
+    Timeout("buying", WaitFor("buy"))   -- a purchase that goes through later still counts (latePurchase)
 end
 
 local function CancelBuy()
@@ -724,7 +790,7 @@ local function BackgroundSearch()
     local dw = NextPlan()
     if dw then
         local r = runtime[dw.itemID]
-        if r and now - r.time < math.max(3, SearchGap() * 2) then return end
+        if r and now - r.time < math.max(SearchGap() * 2, RecheckEvery(dw.itemID)) then return end
         NoteSearch()
         local ok = pcall(C_AuctionHouse.SendSearchQuery, WatchKey(dw), { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
         bgLast = now
@@ -791,8 +857,8 @@ local function BuyGo()
     -- An automatic step the game may have ignored: this press sends it for real
     if state == "pricing" and purchase and purchase.auto then
         purchase.auto = false
-        local ok = pcall(C_AuctionHouse.StartCommoditiesPurchase, purchase.itemID, purchase.qty)
-        if ok then Timeout("pricing", 3) else purchase = nil; SetState("idle") end
+        local ok = StartQuote(purchase.itemID, purchase.qty)
+        if ok then Timeout("pricing", WaitFor("quote")) else purchase = nil; SetState("idle") end
         return
     end
     if state ~= "idle" then return end
@@ -1296,9 +1362,11 @@ twoBox:SetScript("OnEnter", function(self)
     GameTooltip:Show()
 end)
 twoBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
+ns.SetTwoBox = function(on) twoBox:SetChecked(on) end
 twoBox:SetScript("OnClick", function(self)
     EnsureDB()
     AHWatchDB.twoPerPress = self:GetChecked() and true or false
+    if AHWatchDB.twoPerPress then AHWatchDB.secondBuys = nil end   -- start counting afresh
 end)
 
 -- Keep searching the whole list in the background (on by default)
@@ -1612,8 +1680,8 @@ function ManualGo()
     if state == "confirm" and purchase and purchase.manual then ConfirmBuy() return end
     if state == "pricing" and purchase and purchase.manual and purchase.auto then
         purchase.auto = false
-        local ok = pcall(C_AuctionHouse.StartCommoditiesPurchase, purchase.itemID, purchase.qty)
-        if ok then Timeout("pricing", 3) else purchase = nil; SetState("idle") end
+        local ok = StartQuote(purchase.itemID, purchase.qty)
+        if ok then Timeout("pricing", WaitFor("quote")) else purchase = nil; SetState("idle") end
         return
     end
     if state == "searching" and searchAuto and lastSource == "manual" then
@@ -2035,18 +2103,18 @@ end
 goBtn:SetScript("OnClick", Go)
 
 -- Keep a lined-up price fresh: listings come and go, and a press on a price
--- that's a few seconds old is what fails. Once it's QUOTE_FRESH seconds old
--- it's checked again (paced like a search, so it can't time you out).
-local QUOTE_FRESH = 4
+-- that's a few seconds old is what fails. It's checked again once it's
+-- older than that item's deals usually last (1.5-4s), paced like a search
+-- so it can't time you out.
 C_Timer.NewTicker(0.25, function()
     if state ~= "confirm" or not purchase or not ahOpen then return end
-    if GetTime() - (purchase.quotedAt or 0) < QUOTE_FRESH or not CanSearch() then return end
+    if GetTime() - (purchase.quotedAt or 0) < QuoteFresh(purchase.itemID) or not CanSearch() then return end
     NoteSearch()
     pcall(C_AuctionHouse.CancelCommoditiesPurchase)
     purchase.auto, purchase.total = true, nil
     SetState("pricing")
-    if pcall(C_AuctionHouse.StartCommoditiesPurchase, purchase.itemID, purchase.qty) then
-        Timeout("pricing", 3)
+    if StartQuote(purchase.itemID, purchase.qty) then
+        Timeout("pricing", WaitFor("quote"))
     else
         purchase = nil
         SetState("idle")
@@ -2133,6 +2201,21 @@ SlashCmdList["AHWATCH"] = function(msg)
         else
             print("  Your reaction: not measured yet (it's timed from the deal alert to your Buy instantly press)")
         end
+        local lat = AHWatchDB.lat or {}
+        local function ms(v) return v and string.format("%.0fms", v * 1000) or "?" end
+        print(string.format("  Search pace: one every %.2fs (won't go faster than %.2fs)%s", SearchGap(),
+            math.max(MIN_GAP, AHWatchDB.searchFloor or MIN_GAP), SearchPaused() and " - paused by the server right now" or ""))
+        print(string.format("  Server response times: search %s, price check %s, purchase %s, buyout %s",
+            ms(lat.search), ms(lat.quote), ms(lat.buy), ms(lat.bid)))
+        print(string.format("  Gives up waiting after: search %.1fs, price check %.1fs, purchase %.1fs",
+            WaitFor("search"), WaitFor("quote"), WaitFor("buy")))
+        for _, w in ipairs(AHWatchDB.watch) do
+            if AvgLife(w.itemID) then
+                print(string.format("  %s: lined-up price refreshed every %.1fs", w.name or ("Item " .. w.itemID), QuoteFresh(w.itemID)))
+            end
+        end
+        local sb = AHWatchDB.secondBuys
+        if sb then print(string.format("  2 per press: second buys worked %d, failed %d", sb.ok, sb.fail)) end
     elseif isAlert then
         EnsureDB()
         AHWatchDB.dealAlert = (AHWatchDB.dealAlert == false)
@@ -2342,6 +2425,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
 
     elseif e == "COMMODITY_PRICE_UPDATED" then
         if state ~= "pricing" or not purchase then return end
+        Answered("quote")
         local unitPrice, total = a1, a2
         -- Safety check: the real price must still be within your max, your gold and your limit
         if total and total <= purchase.qty * purchase.max and total <= Budget() then
@@ -2372,6 +2456,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         SetState("idle")
 
     elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
+        Answered("buy")
         -- (latePurchase: it timed out and we moved on, but it went through after all)
         local p, late = purchase or latePurchase, (purchase == nil)
         latePurchase = nil
@@ -2402,6 +2487,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         end
 
     elseif e == "COMMODITY_PURCHASE_FAILED" then
+        Answered("buy")
         latePurchase = nil
         if purchase then
             DealLost(purchase.itemID)
