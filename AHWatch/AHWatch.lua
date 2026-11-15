@@ -121,6 +121,71 @@ local function Ready()
     return true
 end
 
+------------------------------------------------------------
+-- Search pacing: every search the addon sends (background scanning, the
+-- big button, Find item, the Sell tab's Check price) waits its turn, a set
+-- gap apart. If the server pushes back ("too fast", "busy", a dropped
+-- request...), the gap doubles, searching pauses for a bit, and the slower
+-- pace is remembered. After a long run without trouble it speeds back up a
+-- little at a time - never past the pace that caused trouble.
+-- Buying is never held back by this.
+------------------------------------------------------------
+
+local DEFAULT_GAP, MIN_GAP, MAX_GAP = 1.5, 0.5, 10
+local lastSearchAt, pauseUntil, goodStreak = 0, 0, 0
+
+local function SearchGap() return (AHWatchDB and AHWatchDB.searchGap) or DEFAULT_GAP end
+
+-- Seconds until the next search may go out (0 = now)
+local function SearchWait()
+    local now = GetTime()
+    return math.max(0, lastSearchAt + SearchGap() - now, pauseUntil - now)
+end
+local function SearchPaused() return GetTime() < pauseUntil end
+local function CanSearch() return SearchWait() <= 0 and Ready() end
+local function NoteSearch() lastSearchAt = GetTime() end
+
+local bgMissesReset   -- set by the background watcher, further down
+
+local function SlowDown()
+    local now = GetTime()
+    if now - lastSearchAt > 5 or now < pauseUntil then return end   -- not ours, or already handled
+    local old = SearchGap()
+    local new = math.min(MAX_GAP, math.max(old * 2, old + 1))
+    AHWatchDB.searchGap = new
+    -- Don't speed back up past the pace that got this response
+    AHWatchDB.searchFloor = math.min(MAX_GAP, math.max(AHWatchDB.searchFloor or 0, old * 1.25))
+    local pause = math.max(10, new * 4)
+    pauseUntil = now + pause
+    goodStreak = 0
+    if bgMissesReset then bgMissesReset() end
+    Msg(string.format("the auction house asked us to slow down - searching paused for %ds, then one search every %.1fs.",
+        math.floor(pause + 0.5), new))
+end
+
+-- An answer came back fine: after a long run of them, speed up a little
+local function SearchAnswered()
+    goodStreak = goodStreak + 1
+    if goodStreak < 30 then return end
+    goodStreak = 0
+    local floor = math.max(MIN_GAP, AHWatchDB.searchFloor or 1.0)
+    local g = SearchGap()
+    if g > floor then AHWatchDB.searchGap = math.max(floor, g * 0.9) end
+end
+
+-- Server messages that mean "too fast"
+local SLOW_WORDS = { "too fast", "too many", "too quickly", "slow down", "throttl", "busy", "try again",
+    "timed out", "time out", "timeout", "wait", "internal auction error", "database error" }
+local function IsSlowDownMessage(text)
+    text = (text or ""):lower()
+    for _, word in ipairs(SLOW_WORDS) do
+        if text:find(word, 1, true) then return true end
+    end
+    return false
+end
+
+ns.CanSearch, ns.NoteSearch, ns.SearchWait = CanSearch, NoteSearch, SearchWait
+
 local function FindWatch(itemID)
     for i, w in ipairs(AHWatchDB.watch) do
         if w.itemID == itemID then return w, i end
@@ -242,17 +307,20 @@ end
 -- auto = started by the addon itself (not a press). If the game ignores an
 -- automatic request, the next press simply sends it again for real.
 local function Search(w, auto)
+    if not CanSearch() then return false end   -- not its turn yet (search pacing)
     local key = w.itemKey or C_AuctionHouse.MakeItemKey(w.itemID)
     runtime[w.itemID] = nil
     searchAuto = auto and true or false
     SetState("searching")
+    NoteSearch()
     local ok, err = pcall(C_AuctionHouse.SendSearchQuery, key, { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
     if not ok then
         if not auto then Msg("search failed: " .. tostring(err)) end
         SetState("idle")
-        return
+        return false
     end
-    Timeout("searching", 6)
+    Timeout("searching", math.max(6, SearchGap() + 4))
+    return true
 end
 
 -- A buyout the server never confirmed: take it back off the spent/bought counts
@@ -394,7 +462,6 @@ end
 -- press; only buying needs one), so presses go to buying, not searching.
 ------------------------------------------------------------
 
-local BG_EVERY = 0.3           -- as fast as the server's own throttle allows
 local BG_REFRESH = 1.5         -- re-search an item once its results are this old
 local bgPending = nil          -- { itemID, t } background search waiting for results
 local bgLast, bgMisses = 0, 0
@@ -407,7 +474,7 @@ local function BackgroundSearch()
     if not (AHWatchFrame and AHWatchFrame:IsShown()) then return end
     local now = GetTime()
     if bgPending then
-        if now - bgPending.t < 5 then return end
+        if now - bgPending.t < math.max(5, SearchGap() + 3) then return end
         -- No answer: after a few in a row, this client doesn't allow it
         bgPending = nil
         bgMisses = bgMisses + 1
@@ -418,7 +485,7 @@ local function BackgroundSearch()
             return
         end
     end
-    if now - bgLast < BG_EVERY or not Ready() then return end
+    if not CanSearch() then return end   -- search pacing: as fast as the server allows, no faster
     local list = AHWatchDB.watch
     if #list == 0 then return end
     -- A deal is waiting: leave the server free so your press buys it at once
@@ -432,10 +499,13 @@ local function BackgroundSearch()
     end
     if not pick then return end
     local key = pick.itemKey or C_AuctionHouse.MakeItemKey(pick.itemID)
+    NoteSearch()
     local ok = pcall(C_AuctionHouse.SendSearchQuery, key, { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
     bgLast = now
     if ok then bgPending = { itemID = pick.itemID, t = now } end
 end
+-- Being told to slow down isn't the client ignoring background searches
+bgMissesReset = function() bgMisses, bgPending = 0, nil end
 C_Timer.NewTicker(0.3, BackgroundSearch)
 
 local function BgResults(itemID)
@@ -1332,7 +1402,11 @@ local function ManualText()
     end
     if LimitReached() then return "Spend limit reached" end
     local r = runtime[w.itemID]
-    if not r or not r.rows or GetTime() - r.time > STALE_AFTER then return "Search: " .. name end
+    if not r or not r.rows or GetTime() - r.time > STALE_AFTER then
+        if SearchPaused() then return string.format("Search: %s (server pause, %ds)", name, math.ceil(SearchWait())) end
+        local wait = SearchWait()
+        return "Search: " .. name .. (wait > 0.05 and string.format(" (in %.1fs)", wait) or "")
+    end
     local plan, summary = Plan(w)
     if plan and plan.kind == "commodity" then
         return "BUY " .. plan.qty .. "x " .. name .. " for " .. Money(plan.total)
@@ -1374,8 +1448,11 @@ local function GoText()
     elseif plan then
         return "BUY " .. (bw.name or "item") .. " for " .. Money(plan.price)
     end
+    if SearchPaused() then
+        return string.format("Server asked to slow down - scanning again in %ds", math.ceil(SearchWait()))
+    end
     local n = #list
-    return "Watching " .. n .. " item" .. (n == 1 and "" or "s") .. " - nothing at your price yet"
+    return string.format("Watching %d item%s - nothing yet (1 search / %.1fs)", n, n == 1 and "" or "s", SearchGap())
 end
 
 -- Used by Flip opportunities (Prices.lua): adds an item to the watch list at
@@ -1531,6 +1608,11 @@ local function PickFromText()
     end
     if text == "" then return end
     if not ahOpen then Msg("open the auction house to search.") return end
+    if not CanSearch() then
+        Msg(string.format("waiting so the server doesn't time you out - search again in %.1fs.", math.max(0.1, SearchWait())))
+        return
+    end
+    NoteSearch()
     browse, selectedBrowse, browseOffset = {}, nil, 0
     browseQuery = text:lower():gsub("^%s+", ""):gsub("%s+$", "")
     browsePending = true
@@ -1689,6 +1771,7 @@ SLASH_AHWATCH2 = "/ahwatch"
 SlashCmdList["AHWATCH"] = function(msg)
     local mb = (msg or ""):match("^%s*limit%s*(%S*)")
     local ml = (msg or ""):match("^%s*minlisted%s*(%S*)")
+    local sg = (msg or ""):match("^%s*searchgap%s*(%S*)")
     local ma = (msg or ""):match("^%s*avgqty%s*(%S*)")
     if (msg or ""):match("^%s*data%s*$") and ns.PrintData then
         ns.PrintData()
@@ -1696,6 +1779,16 @@ SlashCmdList["AHWATCH"] = function(msg)
         ns.ToggleLedger()
     elseif mb and ns.SetLimit then
         ns.SetLimit(mb)
+    elseif sg then
+        EnsureDB()
+        local n = tonumber(sg)
+        if not n or n < MIN_GAP or n > MAX_GAP then
+            Msg(string.format("usage: /ahw searchgap <seconds>  (%.1f-%d; now %.1f). How long to wait between auction "
+                .. "house searches. It also slows down by itself if the server says it's too fast.", MIN_GAP, MAX_GAP, SearchGap()))
+        else
+            AHWatchDB.searchGap, AHWatchDB.searchFloor = n, n
+            Msg(string.format("one search every %.1fs from now on (it won't speed up past that by itself).", n))
+        end
     elseif ml then
         local n = tonumber(ml)
         if not n or n < 0 then
@@ -1741,6 +1834,7 @@ for _, e in ipairs({
     "COMMODITY_PRICE_UPDATED", "COMMODITY_PRICE_UNAVAILABLE", "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED",
     "AUCTION_HOUSE_THROTTLED_SYSTEM_READY", "PLAYER_MONEY", "GET_ITEM_INFO_RECEIVED",
     "AUCTION_HOUSE_PURCHASE_COMPLETED",
+    "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", "UI_ERROR_MESSAGE", "CHAT_MSG_SYSTEM",
 }) do
     pcall(ev.RegisterEvent, ev, e)
 end
@@ -1844,6 +1938,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         end
         table.sort(rows, function(x, y) return x.unitPrice < y.unitPrice end)
         runtime[a1] = { rows = rows, time = GetTime() }
+        SearchAnswered()
         if ns.RecordRows then ns.RecordRows(a1, rows, true) end
         if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
         BgResults(a1)
@@ -1869,6 +1964,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         end
         table.sort(rows, function(x, y) return x.buyout / math.max(x.quantity, 1) < y.buyout / math.max(y.quantity, 1) end)
         runtime[key.itemID] = { rows = rows, time = GetTime() }
+        SearchAnswered()
         if ns.RecordRows then ns.RecordRows(key.itemID, rows, false) end
         if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
         BgResults(key.itemID)
@@ -1933,6 +2029,14 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         Msg("purchase failed - press again to refresh.")
         purchase = nil
         SetState("idle")
+
+    elseif e == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" then
+        if ahOpen then SlowDown() end
+
+    elseif e == "UI_ERROR_MESSAGE" or e == "CHAT_MSG_SYSTEM" then
+        -- (UI_ERROR_MESSAGE gives an error type then the text; chat gives the text)
+        local text = (type(a2) == "string" and a2) or (type(a1) == "string" and a1) or ""
+        if ahOpen and IsSlowDownMessage(text) then SlowDown() end
 
     elseif e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
         -- The server confirmed an item buyout

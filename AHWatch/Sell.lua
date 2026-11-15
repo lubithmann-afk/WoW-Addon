@@ -683,6 +683,13 @@ local function CheckPrice()
     local e = Selected()
     if not e or not ns.IsAHOpen() then return end
     if not ns.Ready() then return end
+    -- Same search pacing as the rest of the addon, so the server doesn't time you out
+    if ns.CanSearch and not ns.CanSearch() then
+        Msg(string.format("waiting so the server doesn't time you out - try again in %.1fs.",
+            math.max(0.1, ns.SearchWait and ns.SearchWait() or 1)))
+        return
+    end
+    if ns.NoteSearch then ns.NoteSearch() end
     ns.sellSearchID = e.itemID
     -- Use the exact item (item level etc.) so gear searches find the right listings
     local key
