@@ -26,6 +26,7 @@ local spent = 0                 -- copper spent this session
 local ahOpen = false
 local purchaseToken = nil       -- identifies the step a timeout belongs to
 local browsePending = false     -- true while our own name search is waiting for results
+local browsePendingAt = 0       -- when it went out (a search that never answers stops blocking after 5s)
 local searchAuto = false        -- the search in progress was started by the addon, not a press
 local pendingBids = {}          -- item buyouts sent, waiting for the server to confirm
 local lastMoney = nil           -- gold last seen, to spot a buyout going through
@@ -469,10 +470,84 @@ local bgBroken = false         -- the game ignored background searches: presses 
 
 function AutoSearchOn() return AHWatchDB and AHWatchDB.autoSearch ~= false and not bgBroken end
 
+-- One search for the whole list: the auction house's favorites search (the
+-- star button) returns the cheapest price of every favorited item at once.
+-- Watched items are starred, that one search runs every turn, and only an
+-- item showing a price at or under your max gets its own full search -
+-- instead of one search per item per round.
+local favPending = nil          -- time the favorites search went out
+local favMisses = 0
+local favBroken = false         -- this client can't do it: one item per search instead
+local hot = {}                  -- itemID -> true: priced at/under your max, search it next
+local hotOrder = {}
+
+local function FavoritesOK()
+    return not favBroken and C_AuctionHouse and C_AuctionHouse.SearchForFavorites and C_AuctionHouse.SetFavoriteItem
+end
+
+local function WatchKey(w) return w.itemKey or C_AuctionHouse.MakeItemKey(w.itemID) end
+
+-- Star every watched item (remembering which ones we starred, so removing
+-- an item from the list un-stars only those)
+local function SyncFavorites()
+    if not FavoritesOK() or not ahOpen then return end
+    AHWatchDB.favAdded = AHWatchDB.favAdded or {}
+    for _, w in ipairs(AHWatchDB.watch) do
+        local key = WatchKey(w)
+        local okF, isFav = pcall(C_AuctionHouse.IsFavoriteItem, key)
+        if okF and not isFav then
+            if pcall(C_AuctionHouse.SetFavoriteItem, key, true) then AHWatchDB.favAdded[w.itemID] = true end
+        end
+    end
+end
+ns.SyncFavorites = SyncFavorites
+
+local function UnfavoriteIfOurs(w)
+    if not (w and AHWatchDB.favAdded and AHWatchDB.favAdded[w.itemID]) then return end
+    AHWatchDB.favAdded[w.itemID] = nil
+    if C_AuctionHouse and C_AuctionHouse.SetFavoriteItem then pcall(C_AuctionHouse.SetFavoriteItem, WatchKey(w), false) end
+end
+
+local function MarkHot(itemID)
+    if not hot[itemID] then hot[itemID] = true; table.insert(hotOrder, itemID) end
+end
+
+-- Favorites results: queue up the items worth a full search
+local function FavoritesResults()
+    favPending, favMisses = nil, 0
+    local ok, results = pcall(C_AuctionHouse.GetBrowseResults)
+    local seen = {}
+    for _, res in ipairs((ok and results) or {}) do
+        local id = res.itemKey and res.itemKey.itemID
+        local w = id and FindWatch(id)
+        if w and res.minPrice then
+            seen[id] = true
+            local max = MaxPriceFor(w)
+            local want = not (w.maxQty and w.maxQty > 0 and (w.bought or 0) >= w.maxQty)
+            if max and want and res.minPrice <= max then MarkHot(id) end
+        end
+    end
+    -- A watched item missing from the results (not listed right now) needs no search
+    return seen
+end
+
 local function BackgroundSearch()
     if not AutoSearchOn() or not ahOpen or state ~= "idle" or CurrentTab() ~= "buy" then return end
     if not (AHWatchFrame and AHWatchFrame:IsShown()) then return end
+    if browsePending then   -- your own Find item search is on its way
+        if GetTime() - browsePendingAt < 5 then return end
+        browsePending = false
+    end
     local now = GetTime()
+    if favPending and now - favPending > math.max(5, SearchGap() + 3) then
+        favPending = nil
+        favMisses = favMisses + 1
+        if favMisses >= 3 then
+            favBroken = true   -- fall back to one item per search
+            Msg("this client's favorites search isn't answering - checking items one at a time instead.")
+        end
+    end
+    if favPending then return end
     if bgPending then
         if now - bgPending.t < math.max(5, SearchGap() + 3) then return end
         -- No answer: after a few in a row, this client doesn't allow it
@@ -490,7 +565,31 @@ local function BackgroundSearch()
     if #list == 0 then return end
     -- A deal is waiting: leave the server free so your press buys it at once
     if NextPlan() then return end
-    -- The item with the oldest results (or none yet)
+    -- 1) Items the favorites search showed at or under your price: full search, first in line
+    while #hotOrder > 0 do
+        local id = table.remove(hotOrder, 1)
+        hot[id] = nil
+        local w = FindWatch(id)
+        if w then
+            NoteSearch()
+            local ok = pcall(C_AuctionHouse.SendSearchQuery, WatchKey(w), { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
+            bgLast = now
+            if ok then bgPending = { itemID = id, t = now } end
+            return
+        end
+    end
+    -- 2) Otherwise one favorites search covers the whole list
+    if FavoritesOK() then
+        SyncFavorites()
+        NoteSearch()
+        local ok = pcall(C_AuctionHouse.SearchForFavorites, { { sortOrder = SORT_PRICE, reverseSort = false } })
+        if ok then
+            favPending = now
+            return
+        end
+        favBroken = true
+    end
+    -- 3) No favorites search on this client: the item with the oldest results (or none yet)
     local pick, oldest
     for _, w in ipairs(list) do
         local r = runtime[w.itemID]
@@ -1571,6 +1670,7 @@ function Update()
         addBtn:SetText("Add to list")
         addBtn:SetEnabled(selectedBrowse ~= nil)
     end
+    if ns.CheckDealAlert then ns.CheckDealAlert() end
     bindBtn:SetText(capturing == "keybind" and "Press a key..." or ("Key: " .. GetKey()))
     manualKeyBtn:SetText(capturing == "manualKeybind" and "Press a key..." or ("Key: " .. GetManualKey()))
 
@@ -1615,7 +1715,7 @@ local function PickFromText()
     NoteSearch()
     browse, selectedBrowse, browseOffset = {}, nil, 0
     browseQuery = text:lower():gsub("^%s+", ""):gsub("%s+$", "")
-    browsePending = true
+    browsePending, browsePendingAt = true, GetTime()
     local query = {
         searchString = text,
         sorts = { { sortOrder = SORT_PRICE, reverseSort = false } },
@@ -1748,6 +1848,7 @@ for _, b in ipairs(watchRows) do
         local w = AHWatchDB.watch[i]
         if w then runtime[w.itemID] = nil end
         if w and w.itemID == selectedWatchID then selectedWatchID = nil end
+        UnfavoriteIfOurs(w)
         table.remove(AHWatchDB.watch, i)
         if current > #AHWatchDB.watch then current = 1 end
         Update()
@@ -1755,6 +1856,38 @@ for _, b in ipairs(watchRows) do
 end
 
 goBtn:SetScript("OnClick", Go)
+
+-- Deal alert: the moment Watch all finds something at your price, play a
+-- sound and pulse the Buy instantly button until it's bought or gone, so
+-- you can press without having to watch the button. /ahw alert toggles it.
+local dealAlerted = false
+local pulse = CreateFrame("Frame")
+pulse:Hide()
+pulse:SetScript("OnUpdate", function(self, elapsed)
+    self.t = (self.t or 0) + elapsed
+    manualBtn:SetAlpha(0.55 + 0.45 * math.abs(math.cos(self.t * 7)))
+end)
+local function DealReady()
+    if not ahOpen or CurrentTab() ~= "buy" or not AutoSearchOn() or LimitReached() then return false end
+    if state == "confirm" and purchase and not purchase.manual then return true end
+    return state == "idle" and NextPlan() ~= nil
+end
+function ns.CheckDealAlert()
+    local ready = DealReady()
+    if ready and not dealAlerted then
+        dealAlerted = true
+        if AHWatchDB.dealAlert ~= false then
+            local sound = (SOUNDKIT and (SOUNDKIT.RAID_WARNING or SOUNDKIT.READY_CHECK)) or 8959
+            pcall(PlaySound, sound, "Master")
+            pulse.t = 0
+            pulse:Show()
+        end
+    elseif not ready and dealAlerted then
+        dealAlerted = false
+        pulse:Hide()
+        manualBtn:SetAlpha(1)
+    end
+end
 -- Act the moment the key (or mouse button) goes down, not when it's let go
 goBtn:RegisterForClicks("AnyDown")
 manualBtn:RegisterForClicks("AnyDown")
@@ -1772,6 +1905,7 @@ SlashCmdList["AHWATCH"] = function(msg)
     local mb = (msg or ""):match("^%s*limit%s*(%S*)")
     local ml = (msg or ""):match("^%s*minlisted%s*(%S*)")
     local sg = (msg or ""):match("^%s*searchgap%s*(%S*)")
+    local isAlert = (msg or ""):match("^%s*alert%s*$")
     local ma = (msg or ""):match("^%s*avgqty%s*(%S*)")
     if (msg or ""):match("^%s*data%s*$") and ns.PrintData then
         ns.PrintData()
@@ -1779,6 +1913,10 @@ SlashCmdList["AHWATCH"] = function(msg)
         ns.ToggleLedger()
     elseif mb and ns.SetLimit then
         ns.SetLimit(mb)
+    elseif isAlert then
+        EnsureDB()
+        AHWatchDB.dealAlert = (AHWatchDB.dealAlert == false)
+        Msg("deal alert (sound + pulsing Buy instantly button) is now " .. (AHWatchDB.dealAlert and "on" or "off") .. ".")
     elseif sg then
         EnsureDB()
         local n = tonumber(sg)
@@ -1878,6 +2016,8 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
     if e == "AUCTION_HOUSE_SHOW" then
         ahOpen = true
         bgBroken, bgMisses, bgPending = false, 0, nil
+        browsePending = false
+        favBroken, favMisses, favPending, hot, hotOrder = false, 0, nil, {}, {}
         lastMoney = GetMoney()
         ApplyKey()
         f:ClearAllPoints()
@@ -1905,6 +2045,12 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         f:Hide()
 
     elseif e == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
+        if favPending and not browsePending then
+            FavoritesResults()
+            SearchAnswered()
+            Update()
+            return
+        end
         -- Ignore results from the auction house's own search box
         if not browsePending then return end
         browsePending = false
