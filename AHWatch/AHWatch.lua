@@ -209,14 +209,15 @@ local SORT_PRICE = (Enum and Enum.AuctionHouseSortOrder and Enum.AuctionHouseSor
 -- Not getting stuck on purchases that won't work:
 -- - a listing that fails once (already sold but still showing, etc.) is
 --   never tried again this session;
--- - an item whose purchases keep failing takes a break (1 min, then 3,
---   then 10) with one message saying why - no presses or searches are
---   spent on it meanwhile. A successful buy clears it.
+-- - an item whose purchases keep failing takes a short break (20s, then
+--   1 min, then 3) with one message saying why - no presses or searches
+--   are spent on it meanwhile. A successful buy, 10 quiet minutes, or
+--   clicking the item in the watch list clears it.
 ------------------------------------------------------------
 
 local badAuctions = {}          -- auctionID -> true: failed once, skipped from now on
 local itemFails = {}            -- itemID -> { n = fails in a row, t = last fail, untilT, level }
-local BREAKS = { 60, 180, 600 }
+local BREAKS = { 20, 60, 180 }
 
 local function BreakLeft(itemID)
     local f = itemFails[itemID]
@@ -231,6 +232,7 @@ local function BuyFailed(itemID, name, why, threshold)
     local f = itemFails[itemID] or { n = 0, level = 0 }
     itemFails[itemID] = f
     if now - (f.t or 0) > 120 then f.n = 0 end
+    if f.untilT and now - f.untilT > 600 then f.level = 0 end   -- quiet for 10 min: start over
     f.n, f.t = f.n + 1, now
     if f.n < (threshold or 2) then return end
     f.n = 0
@@ -238,11 +240,14 @@ local function BuyFailed(itemID, name, why, threshold)
     local secs = BREAKS[f.level]
     f.untilT = now + secs
     runtime[itemID] = nil
-    Msg(string.format("skipping %s for %s - %s. It'll be tried again after that.",
+    Msg(string.format("skipping %s for %s - %s. Click it in your watch list to try it now.",
         name or "that item", secs >= 120 and ((secs / 60) .. " min") or (secs .. "s"), why))
 end
 
 local function BuyWorked(itemID) itemFails[itemID] = nil end
+local function ClearBreak(itemID)
+    if itemID then itemFails[itemID] = nil else itemFails = {} end
+end
 
 local function Plan(w)
     local r = runtime[w.itemID]
@@ -1716,8 +1721,8 @@ local function ManualText()
     if LimitReached() then return "Spend limit reached" end
     if BreakLeft(w.itemID) > 0 then
         local nxt = NextAfter(w)
-        return string.format("%s skipped (%ds)%s", name, math.ceil(BreakLeft(w.itemID)),
-            nxt and (" - next: " .. (nxt.name or "next item")) or "")
+        return string.format("%s skipped %ds - click it to retry%s", name, math.ceil(BreakLeft(w.itemID)),
+            nxt and (", or press for " .. (nxt.name or "next item")) or "")
     end
     local r = runtime[w.itemID]
     if not r or not r.rows or GetTime() - r.time > STALE_AFTER then
@@ -2056,6 +2061,7 @@ for _, b in ipairs(watchRows) do
         local w = AHWatchDB.watch[self.index]
         if w then
             selectedWatchID = w.itemID   -- Search & buy works on this one
+            ClearBreak(w.itemID)         -- you picked it: try it again now
             -- Load it into the inputs so its max price can be changed with "Add to list"
             local e = { itemID = w.itemID, itemKey = w.itemKey, name = w.name }
             browse, selectedBrowse = { e }, e
@@ -2137,6 +2143,7 @@ SlashCmdList["AHWATCH"] = function(msg)
     local ml = (msg or ""):match("^%s*minlisted%s*(%S*)")
     local sg = (msg or ""):match("^%s*searchgap%s*(%S*)")
     local isAlert = (msg or ""):match("^%s*alert%s*$")
+    local unskip = (msg or ""):match("^%s*unskip%s*$")
     local stats = (msg or ""):match("^%s*stats%s*(%S*)")
     local ma = (msg or ""):match("^%s*avgqty%s*(%S*)")
     if (msg or ""):match("^%s*data%s*$") and ns.PrintData then
@@ -2166,6 +2173,9 @@ SlashCmdList["AHWATCH"] = function(msg)
         else
             print("  Your reaction: not measured yet (it's timed from the deal alert to your Buy instantly press)")
         end
+    elseif unskip then
+        ClearBreak()
+        Msg("every item is back in - nothing is being skipped.")
     elseif isAlert then
         EnsureDB()
         AHWatchDB.dealAlert = (AHWatchDB.dealAlert == false)
@@ -2389,7 +2399,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
             pcall(C_AuctionHouse.CancelCommoditiesPurchase)
             runtime[purchase.itemID] = nil
             -- The real price keeps coming back higher than the search showed: stop trying for a while
-            BuyFailed(purchase.itemID, purchase.name, "its real price keeps coming back higher than listed", 2)
+            BuyFailed(purchase.itemID, purchase.name, "its real price keeps coming back higher than listed", 3)
             purchase = nil
             SetState("idle")
         end
@@ -2398,7 +2408,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         if purchase and not purchase.auto then DealLost(purchase.itemID) end
         if purchase then
             runtime[purchase.itemID] = nil
-            BuyFailed(purchase.itemID, purchase.name, "its listings keep disappearing before they can be bought", 3)
+            BuyFailed(purchase.itemID, purchase.name, "its listings keep disappearing before they can be bought", 4)
             if not purchase.auto then Msg("those listings are gone - press again to refresh.") end
         end
         purchase = nil
@@ -2440,7 +2450,7 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
         if purchase then
             DealLost(purchase.itemID)
             runtime[purchase.itemID] = nil
-            BuyFailed(purchase.itemID, purchase.name, "its purchases keep failing", 2)
+            BuyFailed(purchase.itemID, purchase.name, "its purchases keep failing", 3)
         end
         Msg("purchase failed - press again to refresh.")
         purchase = nil
