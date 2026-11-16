@@ -403,7 +403,27 @@ local function Learn(itemID)
     return x
 end
 
+-- Speed: for each purchase, how long from first spotting the deal to it
+-- being ready to buy, from then to your press, and from your press to the
+-- server confirming it (averages saved; shown in /ahw stats)
+local Speed = { spot = {} }
+function Speed.Spotted(itemID)
+    if not Speed.spot[itemID] then Speed.spot[itemID] = GetTime() end
+end
+function Speed.Done(itemID, readyAt, pressAt)
+    local spot = Speed.spot[itemID]
+    Speed.spot[itemID] = nil
+    if not (spot and readyAt and pressAt) then return end
+    local now = GetTime()
+    local a, b, c = readyAt - spot, pressAt - readyAt, now - pressAt
+    if a < 0 or b < 0 or c < 0 or now - spot > 120 then return end
+    local s = AHWatchDB.speed or { n = 0, ready = 0, press = 0, done = 0 }
+    AHWatchDB.speed = s
+    s.n, s.ready, s.press, s.done = s.n + 1, s.ready + a, s.press + b, s.done + c
+end
+
 local function DealOpened(itemID)
+    Speed.Spotted(itemID)
     if dealOpen[itemID] then return end
     dealOpen[itemID] = { t = GetTime() }
     local x = Learn(itemID)
@@ -415,6 +435,7 @@ end
 -- The deal is gone. If you didn't get any of it, someone else did (or the
 -- seller pulled it): count it as missed and note how long it lasted.
 local function DealClosed(itemID)
+    Speed.spot[itemID] = nil
     local d = dealOpen[itemID]
     if not d then return end
     dealOpen[itemID] = nil
@@ -558,6 +579,7 @@ end
 local function ConfirmBid(i)
     local p = table.remove(pendingBids, i)
     if not p then return end
+    Speed.Done(p.itemID, p.readyAt, p.t)
     NoteLatency("bid", GetTime() - (p.t or GetTime()))
     if p.second then
         AHWatchDB.secondBuys = AHWatchDB.secondBuys or { ok = 0, fail = 0 }
@@ -594,7 +616,9 @@ local function Buy(w, plan, auto, manual, second)
         local qty = plan.row.quantity or 1
         spent = spent + plan.price
         w.bought = (w.bought or 0) + qty
+        local r0 = runtime[w.itemID]
         local p = { auctionID = plan.auctionID, price = plan.price, qty = qty, itemID = w.itemID, name = w.name, w = w, t = GetTime(),
+            readyAt = r0 and r0.time,
             second = second }
         table.insert(pendingBids, p)
         C_Timer.After(WaitFor("bid"), function()
@@ -621,6 +645,7 @@ local function TwoPerPress() return AHWatchDB and AHWatchDB.twoPerPress ~= false
 
 local function ConfirmBuy()
     if not purchase then SetState("idle") return end
+    purchase.pressAt = GetTime()
     Sent("buy")
     local ok, err = pcall(C_AuctionHouse.ConfirmCommoditiesPurchase, purchase.itemID, purchase.qty)
     if not ok then
@@ -745,6 +770,23 @@ end
 -- search, or the favorites scan - which also tells us when it isn't listed)
 local lastChecked = {}
 
+-- A stackable item the scan shows at or under your max: get its price
+-- ready straight away, without waiting for a full search first (the
+-- server's price check still confirms it's within your max). Sized to
+-- the cheapest listing seen in its last full search (1 if never seen).
+-- Gear still needs the full search, to know which listing to buy.
+local function QuoteFromScan(w, minPrice)
+    if not w.isCommodity or state ~= "idle" or not ahOpen or CurrentTab() ~= "buy"
+        or not AutoSearchOn() or LimitReached() or not minPrice or minPrice <= 0 then return false end
+    local qty = w.lowQty or 1
+    if w.maxQty and w.maxQty > 0 then qty = math.min(qty, w.maxQty - (w.bought or 0)) end
+    qty = math.min(qty, math.floor(Budget() / minPrice))
+    if qty < 1 then return false end
+    lastSource = "watch"
+    DealOpened(w.itemID)
+    return Buy(w, { kind = "commodity", qty = qty, total = qty * minPrice }, true) and true or false
+end
+
 local function FavoritesResults()
     favPending, favMisses = nil, 0
     local now = GetTime()
@@ -758,7 +800,12 @@ local function FavoritesResults()
             seen[id] = true
             local max = MaxPriceFor(w)
             local want = not (w.maxQty and w.maxQty > 0 and (w.bought or 0) >= w.maxQty)
-            if max and want and res.minPrice <= max then MarkHot(id) else DealClosed(id) end
+            if max and want and res.minPrice <= max then
+                Speed.Spotted(id)
+                if not QuoteFromScan(w, res.minPrice) then MarkHot(id) end
+            else
+                DealClosed(id)
+            end
         end
     end
     -- A watched item missing from the results isn't listed right now
@@ -2306,7 +2353,7 @@ SlashCmdList["AHWATCH"] = function(msg)
     elseif stats then
         EnsureDB()
         if stats == "reset" then
-            AHWatchDB.learn, AHWatchDB.react = nil, nil
+            AHWatchDB.learn, AHWatchDB.react, AHWatchDB.speed = nil, nil, nil
             Msg("learned stats cleared.")
             return
         end
@@ -2328,6 +2375,16 @@ SlashCmdList["AHWATCH"] = function(msg)
         local function ms(v) return v and string.format("%.0fms", v * 1000) or "?" end
         print(string.format("  Search pace: one every %.2fs (won't go faster than %.2fs)%s", SearchGap(),
             math.max(MIN_GAP, AHWatchDB.searchFloor or MIN_GAP), SearchPaused() and " - paused by the server right now" or ""))
+        local sp = AHWatchDB.speed
+        if sp and sp.n > 0 then
+            local a, b, c = sp.ready / sp.n, sp.press / sp.n, sp.done / sp.n
+            local slow = (a >= b and a >= c) and "finding it and getting it ready"
+                or ((b >= c) and "your press" or "the server confirming the purchase")
+            print(string.format("  Speed (average of %d buys): spotted -> ready %.2fs, ready -> your press %.2fs, "
+                .. "press -> bought %.2fs = %.2fs. Slowest part: %s", sp.n, a, b, c, a + b + c, slow))
+        else
+            print("  Speed: not measured yet (it's timed on every purchase from spotting the deal to it going through)")
+        end
         print(string.format("  Server response times: search %s, price check %s, purchase %s, buyout %s",
             ms(lat.search), ms(lat.quote), ms(lat.buy), ms(lat.bid)))
         print(string.format("  Gives up waiting after: search %.1fs, price check %.1fs, purchase %.1fs",
@@ -2484,6 +2541,11 @@ function On.COMMODITY_SEARCH_RESULTS_UPDATED(e, a1, a2)
         end
     end
     table.sort(rows, function(x, y) return x.unitPrice < y.unitPrice end)
+    if w then
+        for _, r in ipairs(rows) do
+            if not r.own then w.lowQty = r.quantity break end
+        end
+    end
     runtime[a1] = { rows = rows, time = GetTime() }
     lastChecked[a1] = GetTime()
     SearchAnswered()
@@ -2534,6 +2596,7 @@ function On.COMMODITY_PRICE_UPDATED(e, a1, a2)
     if total and total <= purchase.qty * purchase.max and total <= Budget() then
         purchase.total = total
         purchase.quotedAt = GetTime()
+        purchase.readyAt = purchase.readyAt or purchase.quotedAt
         purchase.auto = false   -- the automatic part is done; from here it's a normal purchase
         SetState("confirm")
         Timeout("confirm", 15)
@@ -2573,6 +2636,7 @@ function On.COMMODITY_PURCHASE_SUCCEEDED(e, a1, a2)
         w = p.w or FindWatch(p.itemID)
         if w then w.bought = (w.bought or 0) + p.qty end
         if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.total or 0) end
+        Speed.Done(p.itemID, p.readyAt, p.pressAt)
         DealBought(p.itemID)
         Msg("bought " .. p.qty .. "x " .. (p.name or "item") .. " for " .. Money(p.total or 0) .. ".")
         runtime[p.itemID] = nil
