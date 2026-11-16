@@ -741,8 +741,14 @@ local function MarkHot(itemID)
 end
 
 -- Favorites results: queue up the items worth a full search
+-- When each watched item was last checked on the auction house (a full
+-- search, or the favorites scan - which also tells us when it isn't listed)
+local lastChecked = {}
+
 local function FavoritesResults()
     favPending, favMisses = nil, 0
+    local now = GetTime()
+    for _, w in ipairs(AHWatchDB.watch) do lastChecked[w.itemID] = now end
     local ok, results = pcall(C_AuctionHouse.GetBrowseResults)
     local seen = {}
     for _, res in ipairs((ok and results) or {}) do
@@ -1443,7 +1449,10 @@ for i = 1, WATCH_ROWS do
     b.icon:SetPoint("LEFT", 2, 0)
     b.name = b:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     b.name:SetPoint("TOPLEFT", b.icon, "TOPRIGHT", 6, 0)
-    b.name:SetWidth(260)
+    b.name:SetWidth(214)
+    b.age = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    b.age:SetPoint("TOPRIGHT", b, "TOPRIGHT", -26, -1)
+    b.age:SetJustifyH("RIGHT")
     b.name:SetJustifyH("LEFT")
     b.name:SetWordWrap(false)
     b.info = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -1973,6 +1982,18 @@ function Update()
             end
             b.info:SetText("max " .. MaxText(w) .. progress .. "  |cffaaaaaa" .. status .. "|r")
             b.next:SetShown(w.itemID == selectedWatchID)
+            -- How long since it was last checked (while Watch all is on)
+            local seen = lastChecked[w.itemID]
+            if ahOpen and AHWatchDB.autoSearch ~= false and seen then
+                local ago = GetTime() - seen
+                local color = (ago < 5 and "33dd66") or (ago < 15 and "ffd100") or "ff5555"
+                local txt = ago < 60 and string.format("%ds ago", math.floor(ago)) or string.format("%dm ago", math.floor(ago / 60))
+                b.age:SetText("|cff" .. color .. txt .. "|r")
+            elseif ahOpen and AHWatchDB.autoSearch ~= false then
+                b.age:SetText("|cff888888not yet|r")
+            else
+                b.age:SetText("")
+            end
             b.index = i
             b:Show()
         else
@@ -2382,6 +2403,275 @@ for _, e in ipairs({
     pcall(ev.RegisterEvent, ev, e)
 end
 
+-- Each event has its own function (one giant handler hit Lua's limit on
+-- how many outside variables one function may use)
+local On = {}
+function On.AUCTION_HOUSE_SHOW(e, a1, a2)
+    ahOpen = true
+    bgBroken, bgMisses, bgPending = false, 0, nil
+    browsePending = false
+    favBroken, favMisses, favPending, hot, hotOrder = false, 0, nil, {}, {}
+    lastMoney = GetMoney()
+    ApplyKey()
+    f:ClearAllPoints()
+    local p = AHWatchDB.pos
+    if p then
+        f:SetPoint(p[1], UIParent, p[2], p[3], p[4])
+    elseif AuctionHouseFrame then
+        f:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, 0)
+    else
+        f:SetPoint("CENTER")
+    end
+    f:Show()
+    Update()
+    local w = AHWatchDB.watch[current] or AHWatchDB.watch[1]
+    if w and ns.ShowGraph then ns.ShowGraph(w.itemID, MaxPriceFor(w)) end
+
+end
+
+function On.AUCTION_HOUSE_CLOSED(e, a1, a2)
+    if state == "pricing" or state == "confirm" then pcall(C_AuctionHouse.CancelCommoditiesPurchase) end
+    ahOpen = false
+    purchase = nil
+    state = "idle"
+    lastSource = "watch"
+    dealOpen = {}   -- deals can't be watched while it's closed
+    lastChecked = {}
+    runtime = {}
+    ApplyKey()
+    f:Hide()
+
+end
+
+function On.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED(e, a1, a2)
+    if favPending and not browsePending then
+        FavoritesResults()
+        SearchAnswered()
+        Update()
+        return
+    end
+    -- Ignore results from the auction house's own search box
+    if not browsePending then return end
+    browsePending = false
+    browse = {}
+    local ok, results = pcall(C_AuctionHouse.GetBrowseResults)
+    browseOffset = 0
+    for _, res in ipairs((ok and results) or {}) do
+        if res.itemKey then
+            table.insert(browse, {
+                itemID = res.itemKey.itemID, itemKey = res.itemKey, order = #browse + 1,
+                minPrice = res.minPrice, name = ItemName(res.itemKey.itemID),
+            })
+        end
+    end
+    if #browse == 0 then Msg("no results.") end
+    Update()
+
+end
+
+function On.COMMODITY_SEARCH_RESULTS_UPDATED(e, a1, a2)
+    local w = FindWatch(a1)
+    local isManual = manualW and manualW.itemID == a1
+    local forSell = ns.sellSearchID == a1
+    if not w and not forSell and not isManual then return end
+    if w then w.isCommodity = true end
+    if isManual then manualW.isCommodity = true end
+    local rows = {}
+    for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(a1) or 0 do
+        local r = C_AuctionHouse.GetCommoditySearchResultInfo(a1, i)
+        if r and r.unitPrice and r.quantity then
+            table.insert(rows, { unitPrice = r.unitPrice, quantity = r.quantity, own = r.containsOwnerItem })
+        end
+    end
+    table.sort(rows, function(x, y) return x.unitPrice < y.unitPrice end)
+    runtime[a1] = { rows = rows, time = GetTime() }
+    lastChecked[a1] = GetTime()
+    SearchAnswered()
+    if ns.RecordRows then ns.RecordRows(a1, rows, true) end
+    if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
+    BgResults(a1)
+    if forSell and ns.OnSellResults then ns.OnSellResults(a1, rows, true) end
+    if w then TrackDeal(w) end
+    if isManual and lastSource == "manual" then ManualQuote() elseif w then AutoQuote(w) end
+    Update()
+
+end
+
+function On.ITEM_SEARCH_RESULTS_UPDATED(e, a1, a2)
+    local key = a1
+    local w = key and FindWatch(key.itemID)
+    local isManual = key and manualW and manualW.itemID == key.itemID
+    local forSell = key and ns.sellSearchID == key.itemID
+    if not w and not forSell and not isManual then return end
+    if w then w.isCommodity = false end
+    if isManual then manualW.isCommodity = false end
+    local rows = {}
+    for i = 1, C_AuctionHouse.GetNumItemSearchResults(key) or 0 do
+        local r = C_AuctionHouse.GetItemSearchResultInfo(key, i)
+        if r and r.buyoutAmount then
+            table.insert(rows, { auctionID = r.auctionID, buyout = r.buyoutAmount,
+                quantity = r.quantity or 1, own = r.containsOwnerItem })
+        end
+    end
+    table.sort(rows, function(x, y) return x.buyout / math.max(x.quantity, 1) < y.buyout / math.max(y.quantity, 1) end)
+    runtime[key.itemID] = { rows = rows, time = GetTime() }
+    lastChecked[key.itemID] = GetTime()
+    SearchAnswered()
+    if ns.RecordRows then ns.RecordRows(key.itemID, rows, false) end
+    if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
+    BgResults(key.itemID)
+    if forSell and ns.OnSellResults then ns.OnSellResults(key.itemID, rows, false) end
+    if w then TrackDeal(w) end
+    Update()
+
+end
+
+function On.COMMODITY_PRICE_UPDATED(e, a1, a2)
+    if state ~= "pricing" or not purchase then return end
+    Answered("quote")
+    local unitPrice, total = a1, a2
+    -- Safety check: the real price must still be within your max, your gold and your limit
+    if total and total <= purchase.qty * purchase.max and total <= Budget() then
+        purchase.total = total
+        purchase.quotedAt = GetTime()
+        purchase.auto = false   -- the automatic part is done; from here it's a normal purchase
+        SetState("confirm")
+        Timeout("confirm", 15)
+    else
+        if not purchase.auto then
+            Msg("price went up to " .. Money(unitPrice or 0) .. " each - not buying. Press again to refresh.")
+        end
+        pcall(C_AuctionHouse.CancelCommoditiesPurchase)
+        runtime[purchase.itemID] = nil
+        MarkHot(purchase.itemID)   -- search it again straight away
+        purchase = nil
+        SetState("idle")
+    end
+
+end
+
+function On.COMMODITY_PRICE_UNAVAILABLE(e, a1, a2)
+    if purchase and not purchase.auto then DealLost(purchase.itemID) end
+    if purchase then
+        runtime[purchase.itemID] = nil
+        MarkHot(purchase.itemID)
+        if not purchase.auto then Msg("those listings are gone - press again to refresh.") end
+    end
+    purchase = nil
+    SetState("idle")
+
+end
+
+function On.COMMODITY_PURCHASE_SUCCEEDED(e, a1, a2)
+    Answered("buy")
+    -- (latePurchase: it timed out and we moved on, but it went through after all)
+    local p, late = purchase or latePurchase, (purchase == nil)
+    latePurchase = nil
+    local w
+    if p then
+        spent = spent + (p.total or 0)
+        w = p.w or FindWatch(p.itemID)
+        if w then w.bought = (w.bought or 0) + p.qty end
+        if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.total or 0) end
+        DealBought(p.itemID)
+        Msg("bought " .. p.qty .. "x " .. (p.name or "item") .. " for " .. Money(p.total or 0) .. ".")
+        runtime[p.itemID] = nil
+    end
+    if late then
+        if Update then Update() end
+        return
+    end
+    purchase = nil
+    SetState("idle")
+    -- Search & buy: look again straight away, so the next press can buy more
+    if p and p.manual and w and not (w.maxQty and (w.bought or 0) >= w.maxQty) and not LimitReached() and Ready() then
+        Search(w, true)
+        return
+    end
+    -- Refresh straight away if you still want more, so the next press is ready to buy
+    if not (p and p.manual) and AutoSearchOn() then
+        bgLast = 0   -- Watch all refreshes it straight away
+    end
+
+end
+
+function On.COMMODITY_PURCHASE_FAILED(e, a1, a2)
+    Answered("buy")
+    latePurchase = nil
+    if purchase then
+        DealLost(purchase.itemID)
+        runtime[purchase.itemID] = nil
+        MarkHot(purchase.itemID)
+    end
+    Msg("purchase failed - press again to refresh.")
+    purchase = nil
+    SetState("idle")
+
+end
+
+function On.AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED(e, a1, a2)
+    if ahOpen then SlowDown() end
+
+end
+
+function On.UI_ERROR_MESSAGE(e, a1, a2)
+    -- (UI_ERROR_MESSAGE gives an error type then the text; chat gives the text)
+    local text = (type(a2) == "string" and a2) or (type(a1) == "string" and a1) or ""
+    if ahOpen and IsSlowDownMessage(text) then SlowDown() end
+
+end
+On.CHAT_MSG_SYSTEM = On.UI_ERROR_MESSAGE
+
+function On.AUCTION_HOUSE_PURCHASE_COMPLETED(e, a1, a2)
+    -- The server confirmed an item buyout
+    for i, p in ipairs(pendingBids) do
+        if p.auctionID == a1 then ConfirmBid(i) break end
+    end
+
+end
+
+function On.PLAYER_MONEY(e, a1, a2)
+    -- Gold going down by a buyout's price also confirms it (for clients
+    -- without the event above). Several can land in one money update.
+    local now = GetMoney()
+    if lastMoney and now < lastMoney and #pendingBids > 0 and state ~= "buying" then
+        local drop = lastMoney - now
+        while drop > 0 and #pendingBids > 0 do
+            local pick
+            for i, p in ipairs(pendingBids) do
+                if p.price == drop then pick = i break end
+            end
+            if not pick then
+                for i, p in ipairs(pendingBids) do
+                    if p.price <= drop then pick = i break end
+                end
+            end
+            if not pick then break end
+            drop = drop - pendingBids[pick].price
+            ConfirmBid(pick)
+        end
+    end
+    lastMoney = now
+    if f:IsShown() then Update() end
+
+end
+
+function On.AUCTION_HOUSE_THROTTLED_SYSTEM_READY(e, a1, a2)
+    if f:IsShown() then Update() end
+
+end
+
+function On.GET_ITEM_INFO_RECEIVED(e, a1, a2)
+    -- These come in bursts (dozens at once): redraw once when it settles
+    if f:IsShown() and not itemInfoQueued then
+        itemInfoQueued = true
+        C_Timer.After(0.2, function()
+            itemInfoQueued = false
+            if f:IsShown() then Update() end
+        end)
+    end
+end
+
 ev:SetScript("OnEvent", function(_, e, a1, a2)
     if e == "ADDON_LOADED" and a1 == "AHWatch" then
         EnsureDB()
@@ -2418,237 +2708,6 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
     end
     if not AHWatchDB then return end
 
-    if e == "AUCTION_HOUSE_SHOW" then
-        ahOpen = true
-        bgBroken, bgMisses, bgPending = false, 0, nil
-        browsePending = false
-        favBroken, favMisses, favPending, hot, hotOrder = false, 0, nil, {}, {}
-        lastMoney = GetMoney()
-        ApplyKey()
-        f:ClearAllPoints()
-        local p = AHWatchDB.pos
-        if p then
-            f:SetPoint(p[1], UIParent, p[2], p[3], p[4])
-        elseif AuctionHouseFrame then
-            f:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, 0)
-        else
-            f:SetPoint("CENTER")
-        end
-        f:Show()
-        Update()
-        local w = AHWatchDB.watch[current] or AHWatchDB.watch[1]
-        if w and ns.ShowGraph then ns.ShowGraph(w.itemID, MaxPriceFor(w)) end
-
-    elseif e == "AUCTION_HOUSE_CLOSED" then
-        if state == "pricing" or state == "confirm" then pcall(C_AuctionHouse.CancelCommoditiesPurchase) end
-        ahOpen = false
-        purchase = nil
-        state = "idle"
-        lastSource = "watch"
-        dealOpen = {}   -- deals can't be watched while it's closed
-        runtime = {}
-        ApplyKey()
-        f:Hide()
-
-    elseif e == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
-        if favPending and not browsePending then
-            FavoritesResults()
-            SearchAnswered()
-            Update()
-            return
-        end
-        -- Ignore results from the auction house's own search box
-        if not browsePending then return end
-        browsePending = false
-        browse = {}
-        local ok, results = pcall(C_AuctionHouse.GetBrowseResults)
-        browseOffset = 0
-        for _, res in ipairs((ok and results) or {}) do
-            if res.itemKey then
-                table.insert(browse, {
-                    itemID = res.itemKey.itemID, itemKey = res.itemKey, order = #browse + 1,
-                    minPrice = res.minPrice, name = ItemName(res.itemKey.itemID),
-                })
-            end
-        end
-        if #browse == 0 then Msg("no results.") end
-        Update()
-
-    elseif e == "COMMODITY_SEARCH_RESULTS_UPDATED" then
-        local w = FindWatch(a1)
-        local isManual = manualW and manualW.itemID == a1
-        local forSell = ns.sellSearchID == a1
-        if not w and not forSell and not isManual then return end
-        if w then w.isCommodity = true end
-        if isManual then manualW.isCommodity = true end
-        local rows = {}
-        for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(a1) or 0 do
-            local r = C_AuctionHouse.GetCommoditySearchResultInfo(a1, i)
-            if r and r.unitPrice and r.quantity then
-                table.insert(rows, { unitPrice = r.unitPrice, quantity = r.quantity, own = r.containsOwnerItem })
-            end
-        end
-        table.sort(rows, function(x, y) return x.unitPrice < y.unitPrice end)
-        runtime[a1] = { rows = rows, time = GetTime() }
-        SearchAnswered()
-        if ns.RecordRows then ns.RecordRows(a1, rows, true) end
-        if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
-        BgResults(a1)
-        if forSell and ns.OnSellResults then ns.OnSellResults(a1, rows, true) end
-        if w then TrackDeal(w) end
-        if isManual and lastSource == "manual" then ManualQuote() elseif w then AutoQuote(w) end
-        Update()
-
-    elseif e == "ITEM_SEARCH_RESULTS_UPDATED" then
-        local key = a1
-        local w = key and FindWatch(key.itemID)
-        local isManual = key and manualW and manualW.itemID == key.itemID
-        local forSell = key and ns.sellSearchID == key.itemID
-        if not w and not forSell and not isManual then return end
-        if w then w.isCommodity = false end
-        if isManual then manualW.isCommodity = false end
-        local rows = {}
-        for i = 1, C_AuctionHouse.GetNumItemSearchResults(key) or 0 do
-            local r = C_AuctionHouse.GetItemSearchResultInfo(key, i)
-            if r and r.buyoutAmount then
-                table.insert(rows, { auctionID = r.auctionID, buyout = r.buyoutAmount,
-                    quantity = r.quantity or 1, own = r.containsOwnerItem })
-            end
-        end
-        table.sort(rows, function(x, y) return x.buyout / math.max(x.quantity, 1) < y.buyout / math.max(y.quantity, 1) end)
-        runtime[key.itemID] = { rows = rows, time = GetTime() }
-        SearchAnswered()
-        if ns.RecordRows then ns.RecordRows(key.itemID, rows, false) end
-        if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
-        BgResults(key.itemID)
-        if forSell and ns.OnSellResults then ns.OnSellResults(key.itemID, rows, false) end
-        if w then TrackDeal(w) end
-        Update()
-
-    elseif e == "COMMODITY_PRICE_UPDATED" then
-        if state ~= "pricing" or not purchase then return end
-        Answered("quote")
-        local unitPrice, total = a1, a2
-        -- Safety check: the real price must still be within your max, your gold and your limit
-        if total and total <= purchase.qty * purchase.max and total <= Budget() then
-            purchase.total = total
-            purchase.quotedAt = GetTime()
-            purchase.auto = false   -- the automatic part is done; from here it's a normal purchase
-            SetState("confirm")
-            Timeout("confirm", 15)
-        else
-            if not purchase.auto then
-                Msg("price went up to " .. Money(unitPrice or 0) .. " each - not buying. Press again to refresh.")
-            end
-            pcall(C_AuctionHouse.CancelCommoditiesPurchase)
-            runtime[purchase.itemID] = nil
-            MarkHot(purchase.itemID)   -- search it again straight away
-            purchase = nil
-            SetState("idle")
-        end
-
-    elseif e == "COMMODITY_PRICE_UNAVAILABLE" then
-        if purchase and not purchase.auto then DealLost(purchase.itemID) end
-        if purchase then
-            runtime[purchase.itemID] = nil
-            MarkHot(purchase.itemID)
-            if not purchase.auto then Msg("those listings are gone - press again to refresh.") end
-        end
-        purchase = nil
-        SetState("idle")
-
-    elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
-        Answered("buy")
-        -- (latePurchase: it timed out and we moved on, but it went through after all)
-        local p, late = purchase or latePurchase, (purchase == nil)
-        latePurchase = nil
-        local w
-        if p then
-            spent = spent + (p.total or 0)
-            w = p.w or FindWatch(p.itemID)
-            if w then w.bought = (w.bought or 0) + p.qty end
-            if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.total or 0) end
-            DealBought(p.itemID)
-            Msg("bought " .. p.qty .. "x " .. (p.name or "item") .. " for " .. Money(p.total or 0) .. ".")
-            runtime[p.itemID] = nil
-        end
-        if late then
-            if Update then Update() end
-            return
-        end
-        purchase = nil
-        SetState("idle")
-        -- Search & buy: look again straight away, so the next press can buy more
-        if p and p.manual and w and not (w.maxQty and (w.bought or 0) >= w.maxQty) and not LimitReached() and Ready() then
-            Search(w, true)
-            return
-        end
-        -- Refresh straight away if you still want more, so the next press is ready to buy
-        if not (p and p.manual) and AutoSearchOn() then
-            bgLast = 0   -- Watch all refreshes it straight away
-        end
-
-    elseif e == "COMMODITY_PURCHASE_FAILED" then
-        Answered("buy")
-        latePurchase = nil
-        if purchase then
-            DealLost(purchase.itemID)
-            runtime[purchase.itemID] = nil
-            MarkHot(purchase.itemID)
-        end
-        Msg("purchase failed - press again to refresh.")
-        purchase = nil
-        SetState("idle")
-
-    elseif e == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" then
-        if ahOpen then SlowDown() end
-
-    elseif e == "UI_ERROR_MESSAGE" or e == "CHAT_MSG_SYSTEM" then
-        -- (UI_ERROR_MESSAGE gives an error type then the text; chat gives the text)
-        local text = (type(a2) == "string" and a2) or (type(a1) == "string" and a1) or ""
-        if ahOpen and IsSlowDownMessage(text) then SlowDown() end
-
-    elseif e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
-        -- The server confirmed an item buyout
-        for i, p in ipairs(pendingBids) do
-            if p.auctionID == a1 then ConfirmBid(i) break end
-        end
-
-    elseif e == "PLAYER_MONEY" then
-        -- Gold going down by a buyout's price also confirms it (for clients
-        -- without the event above). Several can land in one money update.
-        local now = GetMoney()
-        if lastMoney and now < lastMoney and #pendingBids > 0 and state ~= "buying" then
-            local drop = lastMoney - now
-            while drop > 0 and #pendingBids > 0 do
-                local pick
-                for i, p in ipairs(pendingBids) do
-                    if p.price == drop then pick = i break end
-                end
-                if not pick then
-                    for i, p in ipairs(pendingBids) do
-                        if p.price <= drop then pick = i break end
-                    end
-                end
-                if not pick then break end
-                drop = drop - pendingBids[pick].price
-                ConfirmBid(pick)
-            end
-        end
-        lastMoney = now
-        if f:IsShown() then Update() end
-
-    elseif e == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" then
-        if f:IsShown() then Update() end
-
-    elseif e == "GET_ITEM_INFO_RECEIVED" then
-        -- These come in bursts (dozens at once): redraw once when it settles
-        if f:IsShown() and not itemInfoQueued then
-            itemInfoQueued = true
-            C_Timer.After(0.2, function()
-                itemInfoQueued = false
-                if f:IsShown() then Update() end
-            end)
-        end
-    end
+    local h = On[e]
+    if h then h(e, a1, a2) end
 end)
