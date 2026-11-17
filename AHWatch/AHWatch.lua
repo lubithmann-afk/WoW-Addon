@@ -1752,7 +1752,7 @@ local cycleBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
 cycleBox:SetSize(20, 20)
 cycleBox:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -298)
 do
-    local cycleLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    local cycleLabel = cycleBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     cycleLabel:SetPoint("RIGHT", cycleBox, "LEFT", -2, 0)
     cycleLabel:SetText("Cycle list")
 end
@@ -1775,7 +1775,7 @@ local twoBox = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
 twoBox:SetSize(20, 20)
 twoBox:SetPoint("TOPLEFT", f, "TOPLEFT", 158, -298)
 do
-    local twoLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    local twoLabel = twoBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     twoLabel:SetPoint("LEFT", twoBox, "RIGHT", 2, 0)
     twoLabel:SetText("2 per press")
 end
@@ -1919,6 +1919,7 @@ bindBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -142, 10)
 -- and doesn't sit on top of the button.
 do
 local themeBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+ns.themeBtn = themeBtn   -- (Settings.lua moves it into the Settings window)
 themeBtn:SetSize(108, 20)
 themeBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 10)
 themeBtn:SetNormalFontObject(GameFontNormalSmall)
@@ -2086,7 +2087,7 @@ end
 ------------------------------------------------------------
 
 local manualBtn = CreateFrame("Button", "AHWatchManualButton", f, "UIPanelButtonTemplate")
-manualBtn:SetSize(248, 26)
+manualBtn:SetSize(332, 26)
 manualBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 72)
 manualBtn.pbAlt = true     -- its own colour, apart from the big button
 manualBtn:SetNormalFontObject(GameFontHighlightSmall)
@@ -2868,6 +2869,14 @@ end
 
 goBtn:SetScript("OnClick", Go)
 
+-- Controls Settings.lua moves into the Settings window, and the tutorial
+-- points at (this file is at Lua's limits, so Settings lives in its own file)
+ns.ui = {
+    f = f, searchBox = searchBox, addBtn = addBtn, autoBox = autoBox, cycleBox = cycleBox, twoBox = twoBox,
+    watchRows = watchRows, resetBtn = resetBtn, goBtn = goBtn, manualBtn = manualBtn,
+    manualKeyBtn = manualKeyBtn, bindBtn = bindBtn, themeBtn = ns.themeBtn, ledgerBtn = ledgerBtn,
+}
+
 -- Keep each button's text inside the button (long text ends in "...")
 for _, b in ipairs({ goBtn, manualBtn, manualKeyBtn, bindBtn }) do
     local fs = b:GetFontString()
@@ -3022,6 +3031,10 @@ SlashCmdList["AHWATCH"] = function(msg)
         ns.PrintData()
     elseif (msg or ""):match("^%s*ledger%s*$") and ns.ToggleLedger then
         ns.ToggleLedger()
+    elseif (msg or ""):match("^%s*settings%s*$") and ns.ToggleSettings then
+        ns.ToggleSettings()
+    elseif (msg or ""):match("^%s*tour%s*$") and ns.StartTour then
+        ns.StartTour()
     elseif mb and ns.SetLimit then
         ns.SetLimit(mb)
     elseif stats then
@@ -3163,6 +3176,14 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
             Msg("updated to version " .. version .. " (was " .. AHWatchDB.lastVersion .. ").")
         end
         if version then AHWatchDB.lastVersion = version end
+        -- One-time pointer to the tutorial
+        if not AHWatchDB.tourOffered then
+            AHWatchDB.tourOffered = true
+            C_Timer.After(8, function()
+                Msg("new here? Open Settings (bottom right of the AH Watch window) and press \"Show me around\" "
+                    .. "for a quick tour - or type /ahw tour.")
+            end)
+        end
         -- One-time pointer to the auto-updater that ships in the addon folder
         if not AHWatchDB.updateHintShown then
             AHWatchDB.updateHintShown = true

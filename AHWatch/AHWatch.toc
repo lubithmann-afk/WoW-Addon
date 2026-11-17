@@ -2,7 +2,7 @@
 ## Title: AHWatch
 ## Notes: Auction house watch list and sell helper: fast one-key buying, margin mode that follows the market, deals, selling tools, a profit ledger, price history and price-trend arrows.
 ## Author: Luke Mann
-## Version: 1.29
+## Version: 1.30
 ## SavedVariables: AHWatchDB, AHWatchPrices, AHWatchItemsData
 
 AHWatch.lua
@@ -10,5 +10,6 @@ Prices.lua
 Sell.lua
 Mine.lua
 Ledger.lua
+Settings.lua
 Theme.lua
 Bags.lua

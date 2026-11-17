@@ -543,7 +543,7 @@ function ns.ApplyTheme(name)
     mode = PALETTES[name] and name or "classic"
     C = PALETTES[mode] or PALETTES.auction
     ns.theme = mode
-    for _, fr in ipairs({ _G.AHWatchFrame, _G.AHWatchGraphFrame, _G.AHWatchLedgerFrame }) do
+    for _, fr in ipairs({ _G.AHWatchFrame, _G.AHWatchGraphFrame, _G.AHWatchLedgerFrame, _G.AHWatchSettingsFrame }) do
         if fr then
             SkinWindow(fr)
             Walk(fr)
