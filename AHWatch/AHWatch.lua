@@ -53,7 +53,9 @@ local Update                    -- defined further down
 -- Shared state kept in one table (this file is near Lua's limit of 200
 -- top-level names): search pacing, the wall readings, timers, list scroll
 local P = {
-    DEFAULT_GAP = 1.5, MIN_GAP = 0.5, MAX_GAP = 10, lastSearchAt = 0, pauseUntil = 0, goodStreak = 0,
+    -- (1.31: the pace may speed up to one search every 0.25s - servers that answer
+    -- fast never pushed back at 0.5s; it still slows down if the server objects)
+    DEFAULT_GAP = 1.5, MIN_GAP = 0.25, MAX_GAP = 10, lastSearchAt = 0, pauseUntil = 0, goodStreak = 0,
     lastChecked = {},              -- itemID -> when it was last checked on the AH (the watch list's "3s ago")
     MAX_WATCH = 20, watchOffset = 0,   -- watch list holds 20; 7 rows show, scroll for the rest
 }
@@ -262,6 +264,14 @@ local function Answered(kind)
     local t = P.sentAt[kind]
     P.sentAt[kind] = nil
     if t then NoteLatency(kind, GetTime() - t) end
+end
+-- A request that's had twice its usual answer time (and at least 0.8s for a
+-- price check, 0.6s for a search) without an answer: probably ignored
+function P.Overdue(kind)
+    local t = P.sentAt[kind]
+    if not t then return true end
+    local usual = AHWatchDB and AHWatchDB.lat and AHWatchDB.lat[kind] or 0.5
+    return GetTime() - t > math.max(kind == "quote" and 0.8 or 0.6, usual * 2)
 end
 local function WaitFor(kind)
     local lim = P.WAIT_LIMITS[kind]
@@ -1129,8 +1139,12 @@ local function BuyGo()
     if #list == 0 then Msg("add an item to your watch list first.") return end
     if state == "confirm" then NoteReaction(); ConfirmBuy() return end   -- a deal is lined up: buy it
     if state ~= "idle" and lastSource == "manual" then return end   -- the big button is mid-search
-    -- An automatic step the game may have ignored: this press sends it for real
+    -- An automatic price check the game may have ignored: this press sends it
+    -- for real - but only once it's clearly overdue. (1.31: pressing nonstop,
+    -- a press nearly always lands while a normal check is still on its way,
+    -- and re-sending it then just started the wait over.)
     if state == "pricing" and purchase and purchase.auto then
+        if not P.Overdue("quote") then return end
         purchase.auto = false
         local ok = StartQuote(purchase.itemID, purchase.qty)
         if ok then Timeout("pricing", WaitFor("quote")) else purchase = nil; SetState("idle") end
@@ -2178,13 +2192,14 @@ function ManualGo()
     end
     if state == "confirm" and purchase and purchase.manual then ConfirmBuy() return end
     if state == "pricing" and purchase and purchase.manual and purchase.auto then
+        if not P.Overdue("quote") then return end   -- still on its way: don't start it over
         purchase.auto = false
         local ok = StartQuote(purchase.itemID, purchase.qty)
         if ok then Timeout("pricing", WaitFor("quote")) else purchase = nil; SetState("idle") end
         return
     end
     if state == "searching" and searchAuto and lastSource == "manual" then
-        if Ready() then Search(w) end
+        if P.Overdue("search") and Ready() then Search(w) end
         return
     end
     if state ~= "idle" then return end
