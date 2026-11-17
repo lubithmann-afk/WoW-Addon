@@ -598,7 +598,15 @@ end
 -- New results for a watched item: is there a deal on it right now?
 local function TrackDeal(w)
     local _, sm = Plan(w)
-    if sm and (sm.under or 0) > 0 then DealOpened(w.itemID) else DealClosed(w.itemID) end
+    if sm and (sm.under or 0) > 0 then
+        DealOpened(w.itemID)
+        -- 1.33: learn how many units a deal on this item usually has (a
+        -- running average), so a price check lined up straight from the scan
+        -- asks for about the right amount the first time
+        w.dealQty = w.dealQty and (w.dealQty * 0.7 + sm.under * 0.3) or sm.under
+    else
+        DealClosed(w.itemID)
+    end
 end
 
 -- Lower = more contested (deals vanish fast, races get lost): bought first
@@ -973,7 +981,10 @@ end
 function P.QuoteFromScan(w, minPrice)
     if not w.isCommodity or state ~= "idle" or not ahOpen or CurrentTab() ~= "buy"
         or not AutoSearchOn() or LimitReached() or not minPrice or minPrice <= 0 then return false end
-    local qty = w.lowQty or 1
+    -- Sized to this item's usual deal (a bit under, so the check isn't too
+    -- big), or 1 if it hasn't had a deal yet. (The cheapest listing seen in a
+    -- search was often a big normal listing, so the check came back too high.)
+    local qty = w.dealQty and math.max(1, math.floor(w.dealQty * 0.8)) or 1
     if w.maxQty and w.maxQty > 0 then qty = math.min(qty, w.maxQty - (w.bought or 0)) end
     qty = math.min(qty, math.floor(Budget() / minPrice))
     if qty < 1 then return false end
