@@ -545,6 +545,18 @@ function P.Speed.Done(itemID, readyAt, pressAt)
     AHWatchDB.speed = sp
     sp.n, sp.ready, sp.press, sp.done = sp.n + 1, sp.ready + a, sp.press + b, sp.done + c
 end
+-- 1.32: the same timings for races you lost (pressed, but someone else's buy
+-- landed first), so /ahw stats shows which step lost them
+function P.Speed.Lost(itemID, readyAt, pressAt)
+    local spot = P.Speed.spot[itemID]
+    if not (spot and readyAt and pressAt) then return end
+    local now = GetTime()
+    local a, b, c = readyAt - spot, pressAt - readyAt, now - pressAt
+    if a < 0 or b < 0 or c < 0 or now - spot > 120 then return end
+    local sp = AHWatchDB.speedLost or { n = 0, ready = 0, press = 0, done = 0 }
+    AHWatchDB.speedLost = sp
+    sp.n, sp.ready, sp.press, sp.done = sp.n + 1, sp.ready + a, sp.press + b, sp.done + c
+end
 
 local function DealOpened(itemID)
     P.Speed.Spotted(itemID)
@@ -681,6 +693,7 @@ local function FailBid(p)
     if (p.w and p.w.bought) == 0 then p.w.bought = nil end
     if not p.second then
         DealLost(p.itemID)
+        P.Speed.Lost(p.itemID, p.readyAt, p.t)
         badAuctions[p.auctionID] = GetTime()
     end
     if p.second then
@@ -820,6 +833,7 @@ end
 local function LostRace(why)
     if purchase and (state == "pricing" or state == "confirm" or state == "buying") then
         if not purchase.auto then DealLost(purchase.itemID) end
+        if state == "buying" then P.Speed.Lost(purchase.itemID, purchase.readyAt, purchase.pressAt) end
         if state ~= "buying" then pcall(C_AuctionHouse.CancelCommoditiesPurchase) end
         local w = FindWatch(purchase.itemID)
         runtime[purchase.itemID] = nil
@@ -965,7 +979,11 @@ function P.QuoteFromScan(w, minPrice)
     if qty < 1 then return false end
     lastSource = "watch"
     DealOpened(w.itemID)
-    return Buy(w, { kind = "commodity", qty = qty, total = qty * minPrice }, true) and true or false
+    if Buy(w, { kind = "commodity", qty = qty, total = qty * minPrice }, true) then
+        if purchase then purchase.fromScan = true end
+        return true
+    end
+    return false
 end
 
 local function FavoritesResults()
@@ -3055,7 +3073,7 @@ SlashCmdList["AHWATCH"] = function(msg)
     elseif stats then
         EnsureDB()
         if stats == "reset" then
-            AHWatchDB.learn, AHWatchDB.react, AHWatchDB.speed = nil, nil, nil
+            AHWatchDB.learn, AHWatchDB.react, AHWatchDB.speed, AHWatchDB.speedLost = nil, nil, nil, nil
             Msg("learned stats cleared.")
             return
         end
@@ -3082,6 +3100,11 @@ SlashCmdList["AHWATCH"] = function(msg)
                 .. "press -> bought %.2fs = %.2fs. Slowest part: %s", sp.n, a, b, c, a + b + c, slow))
         else
             print("  Speed: not measured yet (it's timed on every purchase from spotting the deal to it going through)")
+        end
+        local sl = AHWatchDB.speedLost
+        if sl and sl.n > 0 then
+            print(string.format("  Races lost (average of %d): spotted -> ready %.2fs, ready -> your press %.2fs, "
+                .. "press -> failed %.2fs", sl.n, sl.ready / sl.n, sl.press / sl.n, sl.done / sl.n))
         end
         local lat = AHWatchDB.lat or {}
         local function ms(v) return v and string.format("%.0fms", v * 1000) or "?" end
@@ -3353,6 +3376,20 @@ function ns.OnBuyEvent(e, a1, a2)
             purchase.auto = false   -- the automatic part is done; from here it's a normal purchase
             SetState("confirm")
             Timeout("confirm", 15)
+        elseif purchase.fromScan and purchase.qty > 1 then
+            -- 1.32: lined up from the scan, sized to the cheapest listing seen
+            -- last time - but that cheap listing is smaller now, so the check
+            -- took in pricier units too. Check just 1 unit straight away,
+            -- instead of a full search and a second check (~1s, deal gone).
+            purchase.fromScan = false
+            purchase.qty = 1
+            pcall(C_AuctionHouse.CancelCommoditiesPurchase)
+            if StartQuote(purchase.itemID, 1) then
+                Timeout("pricing", WaitFor("quote"))
+            else
+                purchase = nil
+                SetState("idle")
+            end
         else
             if not purchase.auto then
                 Msg("price went up to " .. Money(unitPrice or 0) .. " each - not buying. Press again to refresh.")
@@ -3412,6 +3449,7 @@ function ns.OnBuyEvent(e, a1, a2)
         latePurchase = nil
         if purchase then
             DealLost(purchase.itemID)
+            P.Speed.Lost(purchase.itemID, purchase.readyAt, purchase.pressAt)
             runtime[purchase.itemID] = nil
             MarkHot(purchase.itemID)
         end
