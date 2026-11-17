@@ -3,8 +3,9 @@
 -- one button (or key) over and over: each press either refreshes the search or
 -- buys the next batch at or under your price that you can afford.
 --
--- The game requires a real click or keypress for every search and purchase,
--- so nothing here runs on its own - every action is one press.
+-- Buying always takes a real click or keypress. With "Watch all" on, the
+-- watch list is searched in the background (searches don't need a press),
+-- so presses go to buying. This merges two developers' versions (1.34).
 
 local _, ns = ...                 -- shared with Prices.lua (price history and graph)
 ns = ns or {}
@@ -12,7 +13,9 @@ ns = ns or {}
 local DEFAULT_KEY = "SHIFT-G"         -- the watch-list button
 local DEFAULT_MANUAL_KEY = "SHIFT-H"  -- the Search & buy button
 local STALE_AFTER = 20          -- seconds before search results count as old
-local BROWSE_ROWS, WATCH_ROWS = 6, 7
+local BROWSE_ROWS, WATCH_ROWS = 5, 7   -- 5 search results / 7 watched items show at a time (scroll for more)
+local SUGGEST_MAX_PCT = 80       -- "Suggested" max on the Buy tab: this % of market
+local browseOffset = 0
 
 local runtime = {}              -- itemID -> { rows = {...}, time = t }
 local browse = {}               -- results of the last name search
@@ -30,6 +33,11 @@ local browsePendingAt = 0       -- when it went out (a search that never answers
 local searchAuto = false        -- the search in progress was started by the addon, not a press
 local pendingBids = {}          -- item buyouts sent, waiting for the server to confirm
 local lastMoney = nil           -- gold last seen, to spot a buyout going through
+-- Follow-up mode: after you buy an item, the button stays on it for a while
+-- (re-searching it instead of cycling on), because a sniped cheap listing
+-- usually draws more low sellers within seconds. /ahw followup <seconds>
+local FOLLOWUP_DEFAULT = 60
+local hotItemID, hotUntil = nil, 0
 local itemInfoQueued = false
 local manualW = nil             -- the watch-list item the Search & buy button works on
 local selectedWatchID = nil     -- the watch-list item you clicked (Search & buy's target)
@@ -42,20 +50,32 @@ local ManualQuote               -- defined with the Search & buy button
 local latePurchase = nil        -- a purchase that timed out mid-buy, in case it still goes through
 local Update                    -- defined further down
 
+-- Shared state kept in one table (this file is near Lua's limit of 200
+-- top-level names): search pacing, the wall readings, timers, list scroll
+local P = {
+    DEFAULT_GAP = 1.5, MIN_GAP = 0.5, MAX_GAP = 10, lastSearchAt = 0, pauseUntil = 0, goodStreak = 0,
+    lastChecked = {},              -- itemID -> when it was last checked on the AH (the watch list's "3s ago")
+    MAX_WATCH = 20, watchOffset = 0,   -- watch list holds 20; 7 rows show, scroll for the rest
+}
+
 ------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------
 
-local lastMsg, lastMsgAt = nil, 0
-local function Msg(text)
-    if text == lastMsg and GetTime() - lastMsgAt < 4 then return end   -- no repeats filling chat
-    lastMsg, lastMsgAt = text, GetTime()
-    print("|cff33ccffAHWatch:|r " .. text)
+local Msg
+do
+    local lastMsg, lastMsgAt = nil, 0
+    Msg = function(text)
+        if text == lastMsg and GetTime() - lastMsgAt < 4 then return end   -- no repeats filling chat
+        lastMsg, lastMsgAt = text, GetTime()
+        print("|cff33ccffAHWatch:|r " .. text)
+    end
 end
 
 local function EnsureDB()
     if type(AHWatchDB) ~= "table" then AHWatchDB = {} end
     AHWatchDB.watch = AHWatchDB.watch or {}
+    AHWatchDB.favorites = AHWatchDB.favorites or {}
 end
 
 local function Money(copper)
@@ -91,7 +111,74 @@ local function MarketPrice(itemID)
     if ok and price and price > 0 then return price end
 end
 
+-- Competitive price ("the wall"): where real supply starts in an item's
+-- listings, skipping the small cheap groups at the bottom - bait, one-off
+-- undercuts, dumps (see WallFromUnits in Prices.lua; /ahw wall tunes it).
+-- 1.29: worked out every time an item's full listings come in (the
+-- background watcher refreshes margin items about once a minute, busy ones
+-- every 30s, and follow-ups after a buy), and smoothed: the middle of the
+-- last 3 readings from the past 10 minutes, so one seller posting or
+-- pulling a stack can't swing your max. Readings older than 5 minutes
+-- don't count. Returns wall, resell (1c under), and how many were listed.
+P.WALL_KEEP, P.WALL_MAX_AGE = 600, 300
+function P.NoteWall(itemID, rows)
+    P.wallAt = P.wallAt or {}
+    P.wallAt[itemID] = GetTime()
+    if not ns.WallFromUnits then return end
+    local units, total = {}, 0
+    for _, row in ipairs(rows) do
+        if not row.own then
+            local q = row.quantity or 1
+            local unit = row.unitPrice or (row.buyout and row.buyout / math.max(q, 1))
+            if unit then units[#units + 1] = { unit, q }; total = total + q end
+        end
+    end
+    table.sort(units, function(x, y) return x[1] < y[1] end)
+    local wall = ns.WallFromUnits(units, total)
+    P.walls = P.walls or {}
+    local list = P.walls[itemID] or {}
+    P.walls[itemID] = list
+    local now = GetTime()
+    if wall then list[#list + 1] = { t = now, wall = math.floor(wall), total = total } end
+    while #list > 3 or (list[1] and now - list[1].t > P.WALL_KEEP) do table.remove(list, 1) end
+end
+
+local function CompetitivePrice(itemID)
+    local list = P.walls and P.walls[itemID]
+    if not list or #list == 0 then return nil end
+    local now = GetTime()
+    if now - list[#list].t > P.WALL_MAX_AGE then return nil end
+    local vals = {}
+    for _, x in ipairs(list) do vals[#vals + 1] = x.wall end
+    table.sort(vals)
+    local wall = vals[math.ceil(#vals / 2)]
+    return wall, math.max(1, wall - 1), list[#list].total
+end
+ns.CompetitivePrice = CompetitivePrice
+
+-- Margin mode: the most you can pay and still make w.margin% reselling
+-- 1c under the competitive price, after the 5% AH cut. With no wall to go
+-- on (thin market, or no fresh listings yet) it goes by the market price
+-- instead, so the item is never just skipped. The margin cap still applies.
+local function MarginMax(itemID, margin)
+    local _, resell = CompetitivePrice(itemID)
+    local fromMarket = false
+    if not resell then
+        resell = MarketPrice(itemID)
+        if not resell then return nil end
+        fromMarket = true
+    end
+    local max = math.floor(resell * 0.95 / (1 + margin / 100))
+    local cap = AHWatchDB and AHWatchDB.marginCap
+    if cap then
+        local m = MarketPrice(itemID)
+        if m then max = math.min(max, math.floor(m * cap / 100)) end
+    end
+    return max, resell, fromMarket
+end
+
 local function MaxPriceFor(w)
+    if w.margin then return (MarginMax(w.itemID, w.margin)) end
     if w.maxPct then
         local m = MarketPrice(w.itemID)
         return m and math.floor(m * w.maxPct / 100) or nil
@@ -100,6 +187,13 @@ local function MaxPriceFor(w)
 end
 
 local function MaxText(w)
+    if w.margin then
+        local max, resell, fromMarket = MarginMax(w.itemID, w.margin)
+        if not max then return "+" .. w.margin .. "% |cff888888(no price yet)|r" end
+        local S = ns.ShortMoney or Money
+        return S(max) .. " |cffaaaaaa+" .. w.margin .. "%, resell " .. S(resell)
+            .. (fromMarket and " (market)" or "") .. "|r"
+    end
     if w.maxPct then
         local m = MaxPriceFor(w)
         return w.maxPct .. "% of market" .. (m and (" (" .. Money(m) .. ")") or " (no price data)")
@@ -126,6 +220,7 @@ local function Ready()
     return true
 end
 
+local SaveToFavorite   -- defined just below FindWatch
 ------------------------------------------------------------
 -- Search pacing: every search the addon sends (background scanning, the
 -- big button, Find item, the Sell tab's Check price) waits its turn, a set
@@ -136,17 +231,15 @@ end
 -- Buying is never held back by this.
 ------------------------------------------------------------
 
-local DEFAULT_GAP, MIN_GAP, MAX_GAP = 1.5, 0.5, 10
-local lastSearchAt, pauseUntil, goodStreak = 0, 0, 0
 
-local function SearchGap() return (AHWatchDB and AHWatchDB.searchGap) or DEFAULT_GAP end
+local function SearchGap() return (AHWatchDB and AHWatchDB.searchGap) or P.DEFAULT_GAP end
 
 -- Seconds until the next search may go out (0 = now)
 local function SearchWait()
     local now = GetTime()
-    return math.max(0, lastSearchAt + SearchGap() - now, pauseUntil - now)
+    return math.max(0, P.lastSearchAt + SearchGap() - now, P.pauseUntil - now)
 end
-local function SearchPaused() return GetTime() < pauseUntil end
+local function SearchPaused() return GetTime() < P.pauseUntil end
 local function CanSearch() return SearchWait() <= 0 and Ready() end
 ------------------------------------------------------------
 -- Response times: how long searches, price checks and purchases actually
@@ -155,8 +248,8 @@ local function CanSearch() return SearchWait() <= 0 and Ready() end
 -- that's hung is given up on fast instead of after a fixed long wait.
 ------------------------------------------------------------
 
-local sentAt = {}
-local WAIT_LIMITS = { search = { 1.5, 6 }, quote = { 1.5, 3 }, buy = { 2, 5 }, bid = { 3, 8 } }
+P.sentAt = {}
+P.WAIT_LIMITS = { search = { 1.5, 6 }, quote = { 1.5, 3 }, buy = { 2, 5 }, bid = { 3, 8 } }
 
 local function NoteLatency(kind, secs)
     if not secs or secs <= 0 or secs > 15 then return end
@@ -164,59 +257,69 @@ local function NoteLatency(kind, secs)
     local old = AHWatchDB.lat[kind]
     AHWatchDB.lat[kind] = old and (old * 0.8 + secs * 0.2) or secs
 end
-local function Sent(kind) sentAt[kind] = GetTime() end
+local function Sent(kind) P.sentAt[kind] = GetTime() end
 local function Answered(kind)
-    local t = sentAt[kind]
-    sentAt[kind] = nil
+    local t = P.sentAt[kind]
+    P.sentAt[kind] = nil
     if t then NoteLatency(kind, GetTime() - t) end
 end
 local function WaitFor(kind)
-    local lim = WAIT_LIMITS[kind]
+    local lim = P.WAIT_LIMITS[kind]
     local l = AHWatchDB and AHWatchDB.lat and AHWatchDB.lat[kind]
     if not l then return lim[2] end
     return math.max(lim[1], math.min(lim[2], l * 3 + 0.5))
 end
 
 local function NoteSearch()
-    lastSearchAt = GetTime()
+    P.lastSearchAt = GetTime()
     Sent("search")
 end
 
 local bgMissesReset   -- set by the background watcher, further down
 
-local function SlowDown()
+-- Gentle on purpose (1.35): a slow-down notice costs a 2-5s pause and a
+-- slightly wider gap - not the 10-40s pauses and doubling gaps before,
+-- which piled up and were remembered between sessions.
+local AUTO_MAX_GAP = 4      -- slowing down by itself never goes past one search every 4s
+local FLOOR_CAP = 2.5       -- the "don't speed up past this" pace it remembers is capped here
+local function SlowDown(why)
     local now = GetTime()
-    if now - lastSearchAt > 5 or now < pauseUntil then return end   -- not ours, or already handled
+    if now - P.lastSearchAt > 5 or now < P.pauseUntil then return end   -- not ours, or already handled
     local old = SearchGap()
-    local new = math.min(MAX_GAP, math.max(old * 2, old + 1))
+    local new = math.min(math.max(old, AUTO_MAX_GAP), math.max(old * 1.5, old + 0.25))
     AHWatchDB.searchGap = new
-    -- Don't speed back up past the pace that got this response
-    AHWatchDB.searchFloor = math.min(MAX_GAP, math.max(AHWatchDB.searchFloor or 0, old * 1.25))
-    local pause = math.max(10, new * 4)
-    pauseUntil = now + pause
-    goodStreak = 0
+    AHWatchDB.searchFloor = math.min(FLOOR_CAP, math.max(AHWatchDB.searchFloor or 0, old))
+    local pause = math.min(5, math.max(2, new * 1.5))
+    P.pauseUntil = now + pause
+    P.goodStreak = 0
     if bgMissesReset then bgMissesReset() end
-    Msg(string.format("the auction house asked us to slow down - searching paused for %ds, then one search every %.1fs.",
-        math.floor(pause + 0.5), new))
+    Msg(string.format("server asked to slow down%s - pausing %ds, then one search every %.1fs.",
+        why and (" (" .. why .. ")") or "", math.floor(pause + 0.5), new))
 end
 
 -- An answer came back fine: after a long run of them, speed up a little
 local function SearchAnswered()
     Answered("search")
-    goodStreak = goodStreak + 1
-    if goodStreak < 20 then return end
-    goodStreak = 0
-    local floor = math.max(MIN_GAP, AHWatchDB.searchFloor or MIN_GAP)
+    P.goodStreak = P.goodStreak + 1
+    if P.goodStreak < 10 then return end
+    P.goodStreak = 0
+    -- The remembered floor relaxes too, so one bad moment isn't kept forever
+    if AHWatchDB.searchFloor and not AHWatchDB.searchFloorManual then
+        AHWatchDB.searchFloor = math.max(P.MIN_GAP, AHWatchDB.searchFloor * 0.9)
+    end
+    local floor = math.max(P.MIN_GAP, AHWatchDB.searchFloor or P.MIN_GAP)
     local g = SearchGap()
-    if g > floor then AHWatchDB.searchGap = math.max(floor, g * 0.9) end
+    if g > floor then AHWatchDB.searchGap = math.max(floor, g * 0.85) end
 end
 
 -- Server messages that mean "too fast"
-local SLOW_WORDS = { "too fast", "too many", "too quickly", "slow down", "throttl", "busy", "try again",
-    "timed out", "time out", "timeout", "wait", "internal auction error", "database error" }
+-- Only real "too fast" wording. ("wait", "busy", "try again", "internal
+-- auction error"... used to count too - but those also show up when someone
+-- else buys a listing first, so every lost race paused searching.)
+P.SLOW_WORDS = { "too fast", "too many", "too quickly", "slow down", "throttl" }
 local function IsSlowDownMessage(text)
     text = (text or ""):lower()
-    for _, word in ipairs(SLOW_WORDS) do
+    for _, word in ipairs(P.SLOW_WORDS) do
         if text:find(word, 1, true) then return true end
     end
     return false
@@ -228,6 +331,17 @@ local function FindWatch(itemID)
     for i, w in ipairs(AHWatchDB.watch) do
         if w.itemID == itemID then return w, i end
     end
+end
+
+-- Copies a watched item's max price/qty into its favorite (if it's one), so
+-- re-adding it from Favorites later brings back the same settings
+SaveToFavorite = function(w)
+    if not w or not AHWatchDB or not AHWatchDB.favorites then return end
+    local fav = AHWatchDB.favorites[w.itemID]
+    if not fav then return end
+    fav.name = w.name or fav.name
+    fav.itemKey = w.itemKey or fav.itemKey
+    fav.maxCopper, fav.maxPct, fav.maxQty, fav.margin = w.maxCopper, w.maxPct, w.maxQty, w.margin
 end
 
 local SORT_PRICE = (Enum and Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price) or 0
@@ -406,24 +520,24 @@ end
 -- Speed: for each purchase, how long from first spotting the deal to it
 -- being ready to buy, from then to your press, and from your press to the
 -- server confirming it (averages saved; shown in /ahw stats)
-local Speed = { spot = {} }
-function Speed.Spotted(itemID)
-    if not Speed.spot[itemID] then Speed.spot[itemID] = GetTime() end
+P.Speed = { spot = {} }
+function P.Speed.Spotted(itemID)
+    if not P.Speed.spot[itemID] then P.Speed.spot[itemID] = GetTime() end
 end
-function Speed.Done(itemID, readyAt, pressAt)
-    local spot = Speed.spot[itemID]
-    Speed.spot[itemID] = nil
+function P.Speed.Done(itemID, readyAt, pressAt)
+    local spot = P.Speed.spot[itemID]
+    P.Speed.spot[itemID] = nil
     if not (spot and readyAt and pressAt) then return end
     local now = GetTime()
     local a, b, c = readyAt - spot, pressAt - readyAt, now - pressAt
     if a < 0 or b < 0 or c < 0 or now - spot > 120 then return end
-    local s = AHWatchDB.speed or { n = 0, ready = 0, press = 0, done = 0 }
-    AHWatchDB.speed = s
-    s.n, s.ready, s.press, s.done = s.n + 1, s.ready + a, s.press + b, s.done + c
+    local sp = AHWatchDB.speed or { n = 0, ready = 0, press = 0, done = 0 }
+    AHWatchDB.speed = sp
+    sp.n, sp.ready, sp.press, sp.done = sp.n + 1, sp.ready + a, sp.press + b, sp.done + c
 end
 
 local function DealOpened(itemID)
-    Speed.Spotted(itemID)
+    P.Speed.Spotted(itemID)
     if dealOpen[itemID] then return end
     dealOpen[itemID] = { t = GetTime() }
     local x = Learn(itemID)
@@ -435,7 +549,7 @@ end
 -- The deal is gone. If you didn't get any of it, someone else did (or the
 -- seller pulled it): count it as missed and note how long it lasted.
 local function DealClosed(itemID)
-    Speed.spot[itemID] = nil
+    P.Speed.spot[itemID] = nil
     local d = dealOpen[itemID]
     if not d then return end
     dealOpen[itemID] = nil
@@ -576,16 +690,34 @@ local function FailBid(p)
     if Update then Update() end
 end
 
+local function FollowupSecs()
+    local n = AHWatchDB and AHWatchDB.followup
+    if n == nil then n = FOLLOWUP_DEFAULT end
+    return n
+end
+local function StartFollowup(itemID)
+    local secs = FollowupSecs()
+    if secs > 0 then hotItemID, hotUntil = itemID, GetTime() + secs end
+end
+-- The item to stay on right now, if any (and only while you still want more of it)
+local function HotWatch()
+    if not hotItemID or GetTime() >= hotUntil then hotItemID = nil return nil end
+    local w = FindWatch(hotItemID)
+    if not w or (w.maxQty and (w.bought or 0) >= w.maxQty) or LimitReached() then hotItemID = nil return nil end
+    return w
+end
+
 local function ConfirmBid(i)
     local p = table.remove(pendingBids, i)
     if not p then return end
-    Speed.Done(p.itemID, p.readyAt, p.t)
     NoteLatency("bid", GetTime() - (p.t or GetTime()))
+    P.Speed.Done(p.itemID, p.readyAt, p.t)
     if p.second then
         AHWatchDB.secondBuys = AHWatchDB.secondBuys or { ok = 0, fail = 0 }
         AHWatchDB.secondBuys.ok = AHWatchDB.secondBuys.ok + 1
     end
     if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.price) end
+    StartFollowup(p.itemID)
     DealBought(p.itemID)
     local qtyText = p.qty > 1 and (p.qty .. "x ") or ""
     Msg("bought " .. qtyText .. (p.name or "item") .. " for " .. Money(p.price) .. ".")
@@ -618,8 +750,7 @@ local function Buy(w, plan, auto, manual, second)
         w.bought = (w.bought or 0) + qty
         local r0 = runtime[w.itemID]
         local p = { auctionID = plan.auctionID, price = plan.price, qty = qty, itemID = w.itemID, name = w.name, w = w, t = GetTime(),
-            readyAt = r0 and r0.time,
-            second = second }
+            second = second, readyAt = r0 and r0.time }
         table.insert(pendingBids, p)
         C_Timer.After(WaitFor("bid"), function()
             for _, q in ipairs(pendingBids) do
@@ -664,8 +795,46 @@ local function CancelBuy()
     SetState("idle")
 end
 
+-- A buy the server turned down - almost always someone else grabbing those
+-- listings first. Before, the game reported this through an error event
+-- AH Watch never listened for, so it sat in "Buying..." (ignoring presses)
+-- until a 10-second timeout, then jumped to the NEXT watched item. Now it
+-- resets at once, stays on the same item, and re-searches so the very next
+-- press can buy whatever is still under your price.
+-- Follow-up searches only run while you're on the Buy tab, so they never
+-- use up the auction house's rate limit while you're posting on Quick Sell
+local function OnBuyTab()
+    return not (AHWatchDB and AHWatchDB.tab) or AHWatchDB.tab == "buy"
+end
+
+local function LostRace(why)
+    if purchase and (state == "pricing" or state == "confirm" or state == "buying") then
+        if not purchase.auto then DealLost(purchase.itemID) end
+        if state ~= "buying" then pcall(C_AuctionHouse.CancelCommoditiesPurchase) end
+        local w = FindWatch(purchase.itemID)
+        runtime[purchase.itemID] = nil
+        Msg((purchase.name or "that item") .. ": " .. (why or "someone else got there first") .. " - refreshing.")
+        purchase, latePurchase = nil, nil
+        purchaseToken = nil       -- cancels the pending timeout
+        searchAuto = false
+        SetState("idle")
+        if w and Ready() and OnBuyTab() then Search(w, true) end
+        return true
+    end
+    -- An item buyout that failed: settle the oldest unconfirmed one now
+    -- instead of waiting out its 8-second timer
+    local p = pendingBids[1]
+    if p then
+        FailBid(p)
+        runtime[p.itemID] = nil
+        if state == "idle" and p.w and AHWatchDB.watch[current] == p.w and Ready() and OnBuyTab() then Search(p.w, true) end
+        return true
+    end
+end
+
 local function CurrentTab() return (AHWatchDB and AHWatchDB.tab) or "buy" end
 ns.CurrentTab = CurrentTab
+
 
 -- Right after fresh results for a commodity, ask for its price straight away
 -- so the next press can confirm - one press per batch instead of two.
@@ -719,6 +888,7 @@ end
 local BG_REFRESH = 1.5         -- re-search an item once its results are this old
 local bgPending = nil          -- { itemID, t } background search waiting for results
 local bgLast, bgMisses = 0, 0
+local bgHotTurn = false        -- follow-up: alternate between the item you just bought and the rest
 local bgBroken = false         -- the game ignored background searches: presses search instead
 
 function AutoSearchOn() return AHWatchDB and AHWatchDB.autoSearch ~= false and not bgBroken end
@@ -734,6 +904,11 @@ local favBroken = false         -- this client can't do it: one item per search 
 local hot = {}                  -- itemID -> true: priced at/under your max, search it next
 local hotOrder = {}
 
+-- On again in 1.29: one search checks the whole watch list, so each item is
+-- looked at every turn instead of once per pass over the list. It stars
+-- watched items in the game's AH favorites; items you starred yourself are
+-- never un-starred. (AH Watch's own favorites - the stars in this window -
+-- are separate.) Falls back to one item per search if the client can't.
 local function FavoritesOK()
     return not favBroken and C_AuctionHouse and C_AuctionHouse.SearchForFavorites and C_AuctionHouse.SetFavoriteItem
 end
@@ -766,16 +941,12 @@ local function MarkHot(itemID)
 end
 
 -- Favorites results: queue up the items worth a full search
--- When each watched item was last checked on the auction house (a full
--- search, or the favorites scan - which also tells us when it isn't listed)
-local lastChecked = {}
-
--- A stackable item the scan shows at or under your max: get its price
--- ready straight away, without waiting for a full search first (the
--- server's price check still confirms it's within your max). Sized to
--- the cheapest listing seen in its last full search (1 if never seen).
--- Gear still needs the full search, to know which listing to buy.
-local function QuoteFromScan(w, minPrice)
+-- 1.28: a stackable item the scan shows at or under your max gets its price
+-- lined up straight away, without a full search first (the server's price
+-- check still confirms it's within your max). Sized to the cheapest listing
+-- seen in its last full search (1 if never seen). Gear still needs the full
+-- search, to know which listing to buy.
+function P.QuoteFromScan(w, minPrice)
     if not w.isCommodity or state ~= "idle" or not ahOpen or CurrentTab() ~= "buy"
         or not AutoSearchOn() or LimitReached() or not minPrice or minPrice <= 0 then return false end
     local qty = w.lowQty or 1
@@ -790,7 +961,7 @@ end
 local function FavoritesResults()
     favPending, favMisses = nil, 0
     local now = GetTime()
-    for _, w in ipairs(AHWatchDB.watch) do lastChecked[w.itemID] = now end
+    for _, w in ipairs(AHWatchDB.watch) do P.lastChecked[w.itemID] = now end
     local ok, results = pcall(C_AuctionHouse.GetBrowseResults)
     local seen = {}
     for _, res in ipairs((ok and results) or {}) do
@@ -801,8 +972,8 @@ local function FavoritesResults()
             local max = MaxPriceFor(w)
             local want = not (w.maxQty and w.maxQty > 0 and (w.bought or 0) >= w.maxQty)
             if max and want and res.minPrice <= max then
-                Speed.Spotted(id)
-                if not QuoteFromScan(w, res.minPrice) then MarkHot(id) end
+                P.Speed.Spotted(id)
+                if not P.QuoteFromScan(w, res.minPrice) then MarkHot(id) end
             else
                 DealClosed(id)
             end
@@ -878,6 +1049,27 @@ local function BackgroundSearch()
             return
         end
     end
+    -- 1b) Margin items: refresh the listings behind their max about once a
+    -- minute (30s for busy ones). Every other turn at most, so spotting deals
+    -- with the one-search scan below never stalls.
+    P.wallTurn = not P.wallTurn
+    if P.wallTurn then
+        local due, dueAge
+        for _, w in ipairs(list) do
+            if w.margin then
+                local age = now - ((P.wallAt and P.wallAt[w.itemID]) or 0)
+                local every = IsContested(w.itemID) and 30 or 60
+                if age > every and (not due or age > dueAge) then due, dueAge = w, age end
+            end
+        end
+        if due then
+            NoteSearch()
+            local ok = pcall(C_AuctionHouse.SendSearchQuery, WatchKey(due), { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
+            bgLast = now
+            if ok then bgPending = { itemID = due.itemID, t = now } end
+            return
+        end
+    end
     -- 2) Otherwise one favorites search covers the whole list
     if FavoritesOK() then
         SyncFavorites()
@@ -889,12 +1081,25 @@ local function BackgroundSearch()
         end
         favBroken = true
     end
-    -- 3) No favorites search on this client: the item with the oldest results (or none yet)
+    -- 3) The item with the oldest results (or none yet). Follow-up: for a
+    -- while after you buy an item, every other search goes to that item, to
+    -- catch the low sellers who usually post right after.
     local pick, oldest
-    for _, w in ipairs(list) do
-        local r = runtime[w.itemID]
+    local hw = HotWatch()
+    bgHotTurn = not bgHotTurn
+    if hw and bgHotTurn then
+        local r = runtime[hw.itemID]
         local age = (r and r.rows) and (now - r.time) or math.huge
-        if age > BG_REFRESH and (not oldest or age > oldest) then pick, oldest = w, age end
+        if age > SearchGap() then pick = hw end
+    end
+    -- Otherwise the item with the oldest results. (1.36 stopped at the first
+    -- item that was due, so the top of a long list got checked over and over.)
+    if not pick then
+        for _, w in ipairs(list) do
+            local r = runtime[w.itemID]
+            local age = (r and r.rows) and (now - r.time) or math.huge
+            if age > BG_REFRESH and (not oldest or age > oldest) then pick, oldest = w, age end
+        end
     end
     if not pick then return end
     local key = pick.itemKey or C_AuctionHouse.MakeItemKey(pick.itemID)
@@ -966,7 +1171,11 @@ local function Go()
         ns.QuickSellGo()
         return
     end
-    if tab == "sell" then
+    if tab == "mine" and ns.MineGo then
+        ns.MineGo()
+        return
+    end
+    if tab == "sell" or tab == "flips" then
         if ns.SetTab then ns.SetTab("buy") end
         return
     end
@@ -1007,6 +1216,7 @@ table.insert(UISpecialFrames, "AHWatchFrame")
 -- big or too small no matter what size we build it at).
 ------------------------------------------------------------
 
+do
 local scaledFrames = {}
 
 local function CurrentScale() return (AHWatchDB and AHWatchDB.uiScale) or 1 end
@@ -1098,6 +1308,7 @@ function ns.AddScaleGrip(frame)
     end)
 end
 
+end
 ns.AddScaleGrip(f)
 
 local titleFS
@@ -1258,15 +1469,44 @@ end
 -- Shared with Sell.lua
 ns.MoneyInput = MoneyInput
 ns.Money = Money
+-- Compact money for narrow columns: "1g 30s", "1s 57c", "57c" (drops zero parts)
+function ns.ShortMoney(copper)
+    copper = math.floor((copper or 0) + 0.5)
+    local g, sv, c = math.floor(copper / 10000), math.floor(copper / 100) % 100, copper % 100
+    if g > 0 then return sv > 0 and string.format("%dg %ds", g, sv) or (g .. "g") end
+    if sv > 0 then return c > 0 and string.format("%ds %dc", sv, c) or (sv .. "s") end
+    return c .. "c"
+end
 ns.Msg = Msg
 ns.GetRuntime = function() return runtime end
 ns.IsAHOpen = function() return ahOpen end
 ns.Ready = Ready
 
+-- Shift-click an item anywhere in AH Watch: search for it in the game's own
+-- auction house window (Browse). Quotes make it an exact-name search.
+function ns.SearchInAH(itemID, name)
+    if type(name) == "string" then name = name:match("%[(.-)%]") or name end   -- item links -> plain name
+    if not name or name == "" or name == "?" then name = ItemName(itemID) end
+    local ahf = AuctionHouseFrame
+    if not (ahf and ahf:IsShown()) then Msg("open the auction house window to search it there.") return end
+    if not name then Msg("that item's info is still loading - try again in a second.") return end
+    if ahf.SetDisplayMode and AuctionHouseFrameDisplayMode and AuctionHouseFrameDisplayMode.Buy then
+        pcall(ahf.SetDisplayMode, ahf, AuctionHouseFrameDisplayMode.Buy)
+    end
+    local bar = ahf.SearchBar
+    if not bar then return end
+    local text = '"' .. name .. '"'
+    if bar.SetSearchText then pcall(bar.SetSearchText, bar, text)
+    elseif bar.SearchBox then bar.SearchBox:SetText(text) end
+    if ns.NoteSearch then ns.NoteSearch() end   -- counts toward search pacing like our own searches
+    if bar.StartSearch then pcall(bar.StartSearch, bar)
+    elseif bar.SearchButton then bar.SearchButton:Click() end
+end
+
 -- Find an item
 Label("Find item:", 14, -32)
 local searchBox = CreateFrame("EditBox", "AHWatchSearchBox", f, "InputBoxTemplate")
-searchBox:SetSize(236, 20)
+searchBox:SetSize(170, 20)
 searchBox:SetPoint("TOPLEFT", f, "TOPLEFT", 22, -48)
 searchBox:SetAutoFocus(false)
 searchBox:HookScript("OnEnter", function(self)
@@ -1277,8 +1517,34 @@ end)
 searchBox:HookScript("OnLeave", function() GameTooltip:Hide() end)
 local searchBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
 searchBtn:SetSize(76, 22)
-searchBtn:SetPoint("LEFT", searchBox, "RIGHT", 8, 0)
+searchBtn:SetPoint("LEFT", searchBox, "RIGHT", 6, 0)
 searchBtn:SetText("Search")
+local favBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+favBtn:SetSize(66, 22)
+favBtn:SetPoint("LEFT", searchBtn, "RIGHT", 4, 0)
+favBtn:SetText("Favorites")
+local browseMode = "search"   -- "search" = name search results, "fav" = your favorites
+
+local STAR = "Interface\\TargetingFrame\\UI-RaidTargetingIcon_1"
+local function StyleStar(btn, on)
+    btn.tex:SetDesaturated(not on)
+    btn.tex:SetAlpha(on and 1 or 0.3)
+end
+local function MakeStar(parent)
+    local s = CreateFrame("Button", nil, parent)
+    s:SetSize(16, 16)
+    s.tex = s:CreateTexture(nil, "ARTWORK")
+    s.tex:SetAllPoints()
+    s.tex:SetTexture(STAR)
+    s:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText(self.on and "Favorite - click to remove" or "Click to favorite", 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    s:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    return s
+end
+
 
 local browseRows = {}
 for i = 1, BROWSE_ROWS do
@@ -1292,8 +1558,14 @@ for i = 1, BROWSE_ROWS do
     b.name:SetPoint("LEFT", b.icon, "RIGHT", 6, 0)
     b.name:SetWidth(180)
     b.name:SetJustifyH("LEFT")
+    b.star = MakeStar(b)
+    b.star:SetPoint("RIGHT", -2, 0)
+    b.toggle = CreateFrame("Button", nil, b, "UIPanelButtonTemplate")
+    b.toggle:SetSize(20, 18)
+    b.toggle:SetPoint("RIGHT", b.star, "LEFT", -3, 0)
+    b.toggle:Hide()
     b.price = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    b.price:SetPoint("RIGHT", -4, 0)
+    b.price:SetPoint("RIGHT", -44, 0)
     b.sel = b:CreateTexture(nil, "BACKGROUND")
     b.sel:SetAllPoints()
     b.sel:SetColorTexture(1, 0.82, 0, 0.15)
@@ -1343,6 +1615,12 @@ Label("Max price each:", 14, -200)
 local maxMoney = MoneyInput(22, -216)
 -- How the max compares with the market, updated as you type:
 -- "50% below market (2s)", or "= 1s 60c each" when using a % instead
+-- Two lines above the max price: vs the current lowest listing, then vs market
+local maxLow = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+maxLow:SetPoint("TOPLEFT", f, "TOPLEFT", 108, -186)
+maxLow:SetWidth(238)
+maxLow:SetJustifyH("LEFT")
+maxLow:SetWordWrap(false)
 local maxVs = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 maxVs:SetPoint("TOPLEFT", f, "TOPLEFT", 108, -200)
 maxVs:SetWidth(238)
@@ -1362,6 +1640,36 @@ do
     pctLabel:SetText("% market")
 end
 pctBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+-- Margin mode: the profit you want; the max follows the competitive price
+local marginBox = CreateFrame("EditBox", "AHWatchMarginBox", f, "InputBoxTemplate")
+marginBox:SetSize(30, 20)
+marginBox:SetPoint("TOPLEFT", f, "TOPLEFT", 144, -242)
+marginBox:SetAutoFocus(false)
+marginBox:SetNumeric(true)
+marginBox:SetMaxLetters(3)
+do
+    local orLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    orLabel:SetPoint("RIGHT", marginBox, "LEFT", -8, 0)
+    orLabel:SetText("or")
+    local mLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    mLabel:SetPoint("LEFT", marginBox, "RIGHT", 4, 0)
+    mLabel:SetText("% profit")
+    local tip = CreateFrame("Frame", nil, f)
+    tip:SetAllPoints(mLabel)
+    tip:EnableMouse(true)
+    tip:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Margin mode", 1, 1, 1)
+        GameTooltip:AddLine("Type the profit you want. The max is worked out from what's listed right now: "
+            .. "1c under where real supply starts (small cheap groups skipped), minus the 5% AH cut and your margin. "
+            .. "It moves with the listings by itself.", 1, 0.9, 0.6, true)
+        GameTooltip:AddLine(string.format("Real supply = at least %d listed, or %d%% of all listed (/ahw wall to change).",
+            ns.WallQty and ns.WallQty() or 20, ns.WallPct and ns.WallPct() or 5), 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    tip:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
+marginBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 
 -- How many to buy in total (0 = as many as fit your price and limit)
 Label("Buy up to", 22, -272, "GameFontHighlightSmall")
@@ -1407,6 +1715,31 @@ end
 local addBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
 addBtn:SetSize(110, 22)
 addBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -240)
+
+-- Fills the max with 80% of market - only when you press it
+local suggestMaxBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+suggestMaxBtn:SetSize(84, 18)
+suggestMaxBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -214)
+suggestMaxBtn:SetText("Suggested")
+suggestMaxBtn:SetNormalFontObject(GameFontNormalSmall)
+suggestMaxBtn:SetHighlightFontObject(GameFontHighlightSmall)
+suggestMaxBtn:SetScript("OnClick", function()
+    local e = selectedBrowse
+    if not e then Msg("pick an item first (search, then click one).") return end
+    local market = MarketPrice(e.itemID)
+    if not market then Msg("no market price for that item yet - type a max price instead.") return end
+    pctBox:SetText("")
+    marginBox:SetText("")
+    -- Goes through the normal "you changed it" path, so it's saved like a typed price
+    maxMoney.SetValue(math.max(1, math.floor(market * SUGGEST_MAX_PCT / 100)))
+    if maxMoney.onChange then maxMoney.onChange(maxMoney.GetValue()) end
+end)
+suggestMaxBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Fill in " .. SUGGEST_MAX_PCT .. "% of the market price as your max.", nil, nil, nil, nil, true)
+    GameTooltip:Show()
+end)
+suggestMaxBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 addBtn:SetText("Add to list")
 addBtn.pbPrimary = true
 
@@ -1496,15 +1829,16 @@ for i = 1, WATCH_ROWS do
     b.icon:SetPoint("LEFT", 2, 0)
     b.name = b:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     b.name:SetPoint("TOPLEFT", b.icon, "TOPRIGHT", 6, 0)
-    b.name:SetWidth(214)
+    b.name:SetWidth(190)
+    -- How long since it was last checked on the AH (with Watch all on)
     b.age = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    b.age:SetPoint("TOPRIGHT", b, "TOPRIGHT", -26, -1)
+    b.age:SetPoint("TOPRIGHT", b, "TOPRIGHT", -50, -1)
     b.age:SetJustifyH("RIGHT")
     b.name:SetJustifyH("LEFT")
     b.name:SetWordWrap(false)
     b.info = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     b.info:SetPoint("BOTTOMLEFT", b.icon, "BOTTOMRIGHT", 6, 0)
-    b.info:SetWidth(270)
+    b.info:SetWidth(252)
     b.info:SetJustifyH("LEFT")
     b.info:SetWordWrap(false)
     b.next = b:CreateTexture(nil, "BACKGROUND")
@@ -1514,10 +1848,23 @@ for i = 1, WATCH_ROWS do
     b.remove.pbClose = true
     b.remove:SetSize(22, 22)
     b.remove:SetPoint("RIGHT", 0, 0)
+    b.star = MakeStar(b)
+    b.star:SetPoint("RIGHT", b.remove, "LEFT", -2, 0)
     b:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+    -- Mouse wheel scrolls the list (it holds up to 20)
+    b:EnableMouseWheel(true)
+    b:SetScript("OnMouseWheel", function(_, delta)
+        local n = AHWatchDB and #AHWatchDB.watch or 0
+        P.watchOffset = math.max(0, math.min(math.max(0, n - WATCH_ROWS), P.watchOffset - delta))
+        if Update then Update() end
+    end)
     b:Hide()
     watchRows[i] = b
 end
+-- "8-14 of 20 (scroll)" when the list is longer than the rows shown
+P.watchHint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+P.watchHint:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -534)
+P.watchHint:SetJustifyH("RIGHT")
 
 -- Spend limit
 Label("Spend limit:", 14, -534)
@@ -1570,6 +1917,7 @@ bindBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -142, 10)
 -- Space W -> OnlyLawns -> back to Auction.
 -- Shifted in from the corner (was -14) so the resize grip there has room
 -- and doesn't sit on top of the button.
+do
 local themeBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
 themeBtn:SetSize(108, 20)
 themeBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 10)
@@ -1600,6 +1948,7 @@ themeBtn:SetScript("OnEnter", function(self)
 end)
 themeBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ns.ThemeLabel = ThemeLabel
+end
 bindBtn:SetNormalFontObject(GameFontNormalSmall)
 bindBtn:SetHighlightFontObject(GameFontHighlightSmall)
 bindBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
@@ -1641,6 +1990,8 @@ end
 -- catches the next key, mouse-wheel notch or side mouse button. The wheel
 -- is the fastest way to press: every notch is a real press, so scrolling
 -- presses far faster than tapping a key.
+local KeyButtonClick, KeyTooltip
+do
 local catcher = CreateFrame("Frame", nil, UIParent)
 catcher:SetAllPoints(UIParent)
 catcher:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -1673,7 +2024,7 @@ local MOUSE_KEYS = { MiddleButton = "BUTTON3", Button4 = "BUTTON4", Button5 = "B
 
 -- Left-click a key button, then press a key (or scroll / side button);
 -- right-click puts it back to the default
-local function KeyButtonClick(which, button)
+function KeyButtonClick(which, button)
     local default = (which == "keybind") and DEFAULT_KEY or DEFAULT_MANUAL_KEY
     local label = (which == "keybind") and "the big button" or "Buy instantly"
     if button == "RightButton" then
@@ -1714,7 +2065,7 @@ local function KeyButtonClick(which, button)
     Update()
 end
 
-local function KeyTooltip(self, title)
+function KeyTooltip(self, title)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
     GameTooltip:SetText(title)
     GameTooltip:AddLine("Left-click, then press a key. Right-click to reset.", 1, 1, 1)
@@ -1725,6 +2076,7 @@ end
 bindBtn:SetScript("OnClick", function(_, button) KeyButtonClick("keybind", button) end)
 bindBtn:SetScript("OnEnter", function(self) KeyTooltip(self, "Big button key") end)
 bindBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
 
 ------------------------------------------------------------
 -- Search & buy: a separate button for the item picked in "Find item",
@@ -1854,6 +2206,7 @@ function ManualGo()
     -- Nothing to buy on this item: move on to the next one (Cycle list),
     -- or look at this one again
     local nxt, idx = NextAfter(w)
+    if HotWatch() == w then nxt = nil end   -- follow-up: stay on the item you just bought
     if nxt then
         selectedWatchID, current = nxt.itemID, idx
         manualW = nxt
@@ -1939,6 +2292,32 @@ end
 -- a given max price if it isn't already watched, makes it the next one up,
 -- switches to the Buy tab, and opens the window - so one press of the key
 -- is all that's left to actually buy it.
+-- Deals tab "Watch" on a price-gap deal: put the item on the watch list in
+-- margin mode, so its max follows where real supply starts (not a fixed
+-- price that goes stale). Selected and ready for the buttons.
+function ns.WatchWithMargin(itemID, name, margin)
+    EnsureDB()
+    local w = FindWatch(itemID)
+    if not w then
+        if #AHWatchDB.watch >= P.MAX_WATCH then
+            Msg("your watch list is full (" .. P.MAX_WATCH .. ") - remove an item first.")
+            return false
+        end
+        w = { itemID = itemID, name = name }
+        table.insert(AHWatchDB.watch, w)
+    end
+    w.margin, w.maxCopper, w.maxPct = margin, nil, nil
+    w.name = w.name or name
+    SaveToFavorite(w)
+    selectedWatchID = w.itemID
+    if ns.SetTab then ns.SetTab("buy") end
+    f:Show()
+    if Update then Update() end
+    Msg("watching " .. (w.name or "that item") .. " for " .. margin .. "% profit - its max follows the market. "
+        .. "Buy instantly (" .. KeyName(GetManualKey()) .. ") buys it when one shows up.")
+    return true
+end
+
 function ns.QuickBuySetup(itemID, name, maxCopper)
     EnsureDB()
     local idx
@@ -1946,8 +2325,8 @@ function ns.QuickBuySetup(itemID, name, maxCopper)
         if entry.itemID == itemID then idx = i break end
     end
     if not idx then
-        if #AHWatchDB.watch >= WATCH_ROWS then
-            Msg("your watch list is full (" .. WATCH_ROWS .. ") - remove an item first, or add " .. (name or "this item")
+        if #AHWatchDB.watch >= P.MAX_WATCH then
+            Msg("your watch list is full (" .. P.MAX_WATCH .. ") - remove an item first, or add " .. (name or "this item")
                 .. " yourself with a smaller max price.")
             return false
         end
@@ -1955,8 +2334,9 @@ function ns.QuickBuySetup(itemID, name, maxCopper)
         idx = #AHWatchDB.watch
     end
     local w = AHWatchDB.watch[idx]
-    w.maxCopper, w.maxPct = maxCopper, nil
+    w.maxCopper, w.maxPct, w.margin = maxCopper, nil, nil
     w.name = w.name or name
+    SaveToFavorite(w)
     current = idx
     selectedWatchID = w.itemID
     if ns.SetTab then ns.SetTab("buy") end
@@ -1986,6 +2366,17 @@ function Update()
             b.icon:SetTexture(ItemIcon(e.itemID))
             b.name:SetText(e.name or "Loading...")
             b.price:SetText(e.minPrice and ("from " .. Money(e.minPrice)) or "")
+            local isFav = AHWatchDB.favorites[e.itemID] ~= nil
+            b.star.on = isFav
+            StyleStar(b.star, isFav)
+            local onBuy = CurrentTab() == "buy"
+            b.star:SetShown(onBuy)
+            if browseMode == "fav" and onBuy then
+                b.toggle:SetText(FindWatch(e.itemID) and "-" or "+")
+                b.toggle:Show()
+            else
+                b.toggle:Hide()
+            end
             b.sel:SetShown(selectedBrowse == e)
             b.entry = e
             b:Show()
@@ -1996,12 +2387,19 @@ function Update()
 
     -- Watch list
     local list = AHWatchDB.watch
+    P.watchOffset = math.max(0, math.min(P.watchOffset, #list - WATCH_ROWS))
+    P.watchHint:SetText(#list > WATCH_ROWS and string.format("%d-%d of %d (scroll)", P.watchOffset + 1,
+        math.min(P.watchOffset + WATCH_ROWS, #list), #list) or "")
     for i, b in ipairs(watchRows) do
-        local w = list[i]
+        local idx = P.watchOffset + i
+        local w = list[idx]
         if w then
             w.name = w.name or ItemName(w.itemID)
             b.icon:SetTexture(ItemIcon(w.itemID))
             b.name:SetText(w.name or "Loading...")
+            local isFav = AHWatchDB.favorites[w.itemID] ~= nil
+            b.star.on = isFav
+            StyleStar(b.star, isFav)
             local r = runtime[w.itemID]
             local status
             if not r or not r.rows then
@@ -2021,16 +2419,24 @@ function Update()
                     status = "none under"
                 end
             end
+            -- A few items priced far under the rest: probably bait
+            local bait = ns.GetBait and ns.GetBait(w.itemID)
+            if bait then
+                status = status .. string.format(" |cffffcc00bait %d@%s|r", bait.qty,
+                    ns.ShortMoney and ns.ShortMoney(bait.low) or Money(bait.low))
+            end
             local progress = ""
             if w.maxQty and w.maxQty > 0 then
                 progress = "  bought " .. (w.bought or 0) .. "/" .. w.maxQty
             elseif (w.bought or 0) > 0 then
                 progress = "  bought " .. w.bought
             end
+            if hotItemID == w.itemID and GetTime() < hotUntil then
+                status = status .. string.format(" |cff66ff66following up %ds|r", math.ceil(hotUntil - GetTime()))
+            end
             b.info:SetText("max " .. MaxText(w) .. progress .. "  |cffaaaaaa" .. status .. "|r")
             b.next:SetShown(w.itemID == selectedWatchID)
-            -- How long since it was last checked (while Watch all is on)
-            local seen = lastChecked[w.itemID]
+            local seen = P.lastChecked[w.itemID]
             if ahOpen and AHWatchDB.autoSearch ~= false and seen then
                 local ago = GetTime() - seen
                 local color = (ago < 5 and "33dd66") or (ago < 15 and "ffd100") or "ff5555"
@@ -2041,7 +2447,10 @@ function Update()
             else
                 b.age:SetText("")
             end
-            b.index = i
+            -- The X and star draw above the other tabs' panels - Buy tab only
+            b.remove:SetShown(CurrentTab() == "buy")
+            b.star:SetShown(CurrentTab() == "buy")
+            b.index = idx
             b:Show()
         else
             b:Hide()
@@ -2068,14 +2477,30 @@ function Update()
     bindBtn:SetText(capturing == "keybind" and "Press a key..." or ("Key: " .. KeyName(GetKey())))
     manualKeyBtn:SetText(capturing == "manualKeybind" and "Press..." or KeyName(GetManualKey()))
 
-    ThemeLabel()
+    if ns.ThemeLabel then ns.ThemeLabel() end
 
     local e = selectedBrowse
     if not e then
         maxVs:SetText("")
+        maxLow:SetText("")
     else
         local pct = tonumber(pctBox:GetText() or "")
-        if pct and pct > 0 then
+        local margin = tonumber(marginBox:GetText() or "")
+        -- The max actually in effect, typed or worked out from a % of market
+        local effective = maxMoney.GetValue()
+        if margin and margin > 0 then
+            effective = MarginMax(e.itemID, margin) or 0
+        elseif pct and pct > 0 then
+            local mm = MarketPrice(e.itemID)
+            effective = mm and math.floor(mm * pct / 100) or 0
+        end
+        maxLow:SetText(ns.VsLowest and ns.VsLowest(e.itemID, effective) or "")
+        if margin and margin > 0 then
+            local mx, resell = MarginMax(e.itemID, margin)
+            local S = ns.ShortMoney or Money
+            maxVs:SetText(mx and ("|cffffffff= " .. S(mx) .. " each now|r |cffaaaaaa(resell " .. S(resell) .. ")|r")
+                or "|cff888888needs fresh listings - search it first|r")
+        elseif pct and pct > 0 then
             local m = MarketPrice(e.itemID)
             maxVs:SetText(m and ("|cffffffff= " .. (ns.ShortMoney and ns.ShortMoney(m * pct / 100) or Money(m * pct / 100)) .. " each|r")
                 or "|cff888888no market price yet|r")
@@ -2086,6 +2511,21 @@ function Update()
 end
 ns.Update = Update
 
+-- Called when switching tabs: hide/show the Buy-only bits that would
+-- otherwise show through the Sell, Quick Sell and Flips panels
+function ns.SetBuyOverlaysShown(show)
+    manualBtn:SetShown(show)
+    manualKeyBtn:SetShown(show)
+    for _, b in ipairs(watchRows) do
+        b.remove:SetShown(show and b:IsShown())
+        b.star:SetShown(show and b:IsShown())
+    end
+    for _, b in ipairs(browseRows) do
+        b.star:SetShown(show and b:IsShown())
+        b.toggle:SetShown(show and b:IsShown() and browseMode == "fav")
+    end
+end
+
 ------------------------------------------------------------
 -- Wiring
 ------------------------------------------------------------
@@ -2095,6 +2535,7 @@ local function PickFromText()
     local id = tonumber(text:match("item:(%d+)"))
     if id then
         local e = { itemID = id, name = ItemName(id) }
+        browseMode = "search"
         browse = { e }
         selectedBrowse = e
         Update()
@@ -2102,6 +2543,7 @@ local function PickFromText()
     end
     if text == "" then return end
     if not ahOpen then Msg("open the auction house to search.") return end
+    browseMode = "search"
     if not CanSearch() then
         Msg(string.format("waiting so the server doesn't time you out - search again in %.1fs.", math.max(0.1, SearchWait())))
         return
@@ -2130,13 +2572,17 @@ local function LiveEdit()
     local w = e and FindWatch(e.itemID)
     if not w then Update() return end
     local pct = tonumber(pctBox:GetText() or "")
-    if pct and pct > 0 then
-        w.maxPct, w.maxCopper = pct, nil
+    local margin = tonumber(marginBox:GetText() or "")
+    if margin and margin > 0 then
+        w.margin, w.maxPct, w.maxCopper = margin, nil, nil
+    elseif pct and pct > 0 then
+        w.maxPct, w.maxCopper, w.margin = pct, nil, nil
     elseif maxMoney.GetValue() > 0 then
-        w.maxCopper, w.maxPct = maxMoney.GetValue(), nil
+        w.maxCopper, w.maxPct, w.margin = maxMoney.GetValue(), nil, nil
     end
     local q = tonumber(qtyBox:GetText() or "") or 0
     w.maxQty = (q > 0) and q or nil
+    SaveToFavorite(w)
     if ns.ShowGraph then ns.ShowGraph(w.itemID, MaxPriceFor(w)) end
     Update()
 end
@@ -2144,8 +2590,27 @@ qtyBox:SetScript("OnTextChanged", function(_, userInput) if userInput then LiveE
 qtyUp:HookScript("OnClick", LiveEdit)
 qtyDown:HookScript("OnClick", LiveEdit)
 qtyBox:HookScript("OnMouseWheel", LiveEdit)
-maxMoney.onChange = LiveEdit
-pctBox:SetScript("OnTextChanged", function(_, userInput) if userInput then LiveEdit() end end)
+maxMoney.onChange = function(v)
+    -- Remember the max you typed for this item, for next time you pick it
+    if selectedBrowse then
+        AHWatchDB.myMax = AHWatchDB.myMax or {}
+        AHWatchDB.myMax[selectedBrowse.itemID] = (v and v > 0) and v or nil
+    end
+    if v and v > 0 then pctBox:SetText(""); marginBox:SetText("") end
+    LiveEdit()
+end
+pctBox:SetScript("OnTextChanged", function(_, userInput)
+    if userInput then
+        if (tonumber(pctBox:GetText() or "") or 0) > 0 then marginBox:SetText("") end
+        LiveEdit()
+    end
+end)
+marginBox:SetScript("OnTextChanged", function(_, userInput)
+    if userInput then
+        if (tonumber(marginBox:GetText() or "") or 0) > 0 then pctBox:SetText("") end
+        LiveEdit()
+    end
+end)
 
 capMoney.onChange = function(value)
     AHWatchDB.capCopper = (value > 0) and value or nil
@@ -2170,15 +2635,26 @@ end
 
 for _, b in ipairs(browseRows) do
     b:SetScript("OnClick", function(self)
+        if IsShiftKeyDown() then ns.SearchInAH(self.entry.itemID, self.entry.name) return end
         selectedBrowse = self.entry
         searchBox:SetText(self.entry.name or "")
-        -- Start the max at 80% of the market price when Auctionator knows it
-        local market = MarketPrice(self.entry.itemID)
-        maxMoney.SetValue(market and math.floor(market * 0.8) or 0)
-        pctBox:SetText("")
-        local existing = FindWatch(self.entry.itemID)
+        -- Only ever your own price: the max it's watched at, or the last
+        -- max you typed for it - never a filled-in suggestion
+        local existing = FindWatch(self.entry.itemID) or AHWatchDB.favorites[self.entry.itemID]
+        local mine = AHWatchDB.myMax and AHWatchDB.myMax[self.entry.itemID]
+        marginBox:SetText(existing and existing.margin and tostring(existing.margin) or "")
+        if existing and existing.margin then
+            maxMoney.SetValue(0)
+            pctBox:SetText("")
+        elseif existing and existing.maxPct then
+            maxMoney.SetValue(0)
+            pctBox:SetText(tostring(existing.maxPct))
+        else
+            maxMoney.SetValue((existing and existing.maxCopper) or mine or 0)
+            pctBox:SetText("")
+        end
         qtyBox:SetText(tostring(existing and existing.maxQty or 0))
-        if ns.ShowGraph then ns.ShowGraph(self.entry.itemID, existing and MaxPriceFor(existing)) end
+        if ns.ShowGraph then ns.ShowGraph(self.entry.itemID, existing and (existing.maxCopper or existing.maxPct or existing.margin) and MaxPriceFor(existing)) end
         Update()
     end)
 end
@@ -2189,33 +2665,152 @@ local function AddSelected()
     if not e then Msg("pick an item first (search, then click one).") return end
     local max
     local pct = tonumber(pctBox:GetText() or "")
-    if pct and pct > 0 then
+    local margin = tonumber(marginBox:GetText() or "")
+    if margin and margin > 0 then
+        max = { margin = margin }
+    elseif pct and pct > 0 then
         max = { pct = pct }
     elseif maxMoney.GetValue() > 0 then
         max = { copper = maxMoney.GetValue() }
     end
-    if not max then Msg("set a max price with the coin boxes (or a % of market).") return end
+    if not max then
+        -- Nothing typed: pressing Add uses 80% of market (it never replaces
+        -- a price you typed - it only fills an empty box)
+        local market = MarketPrice(e.itemID)
+        if not market then
+            Msg("no market price for that item yet - type a max price in the coin boxes first.")
+            return
+        end
+        local c = math.max(1, math.floor(market * SUGGEST_MAX_PCT / 100))
+        max = { copper = c }
+        maxMoney.SetValue(c)
+        AHWatchDB.myMax = AHWatchDB.myMax or {}
+        AHWatchDB.myMax[e.itemID] = c
+        Msg("no max typed, so " .. (e.name or "it") .. " was added at " .. SUGGEST_MAX_PCT .. "% of market ("
+            .. Money(c) .. "). Change the coin boxes anytime to set your own.")
+    end
     if max.pct and not MarketPrice(e.itemID) then
-        Msg("Auctionator has no price for that item yet, so a % won't work. Enter a gold amount instead.")
+        Msg("there's no market price for that item yet, so a % won't work. Enter a gold amount instead.")
         return
     end
     local w = FindWatch(e.itemID)
     if not w then
-        if #AHWatchDB.watch >= WATCH_ROWS then Msg("the watch list is full - remove one first.") return end
+        if #AHWatchDB.watch >= P.MAX_WATCH then Msg("the watch list is full - remove one first.") return end
         w = { itemID = e.itemID }
         table.insert(AHWatchDB.watch, w)
     end
     w.itemKey = e.itemKey
     w.name = e.name or ItemName(e.itemID)
-    w.maxCopper, w.maxPct = max.copper, max.pct
+    w.maxCopper, w.maxPct, w.margin = max.copper, max.pct, max.margin
     local q = tonumber(qtyBox:GetText() or "") or 0
     w.maxQty = (q > 0) and q or nil
+    SaveToFavorite(w)
     Update()
 end
 addBtn:SetScript("OnClick", AddSelected)
+
+-- Favorites ------------------------------------------------------------
+local function ToggleFavorite(itemID, name, itemKey)
+    EnsureDB()
+    local favs = AHWatchDB.favorites
+    if favs[itemID] then
+        favs[itemID] = nil
+        Msg((name or ItemName(itemID) or "item") .. " removed from favorites.")
+        if browseMode == "fav" then ns.ShowFavorites() return end
+    else
+        favs[itemID] = { name = name or ItemName(itemID), itemKey = itemKey }
+        SaveToFavorite(FindWatch(itemID))
+        Msg((name or ItemName(itemID) or "item") .. " added to favorites.")
+    end
+    Update()
+end
+
+local function RemoveFromWatch(itemID)
+    for i, w in ipairs(AHWatchDB.watch) do
+        if w.itemID == itemID then
+            SaveToFavorite(w)
+            runtime[itemID] = nil
+            table.remove(AHWatchDB.watch, i)
+            if current > #AHWatchDB.watch then current = 1 end
+            return true
+        end
+    end
+end
+
+-- Favorites button / "+": put a favorite on the watch list with the max it was
+-- saved with. No saved max yet: load it into the inputs and use Add to list.
+local function AddFavoriteToWatch(itemID)
+    EnsureDB()
+    local fav = AHWatchDB.favorites[itemID]
+    if not fav or FindWatch(itemID) then return end
+    if #AHWatchDB.watch >= P.MAX_WATCH then Msg("the watch list is full - remove one first (it stays in favorites).") return end
+    if fav.maxCopper or fav.maxPct or fav.margin then
+        table.insert(AHWatchDB.watch, { itemID = itemID, itemKey = fav.itemKey, name = fav.name or ItemName(itemID),
+            maxCopper = fav.maxCopper, maxPct = fav.maxPct, maxQty = fav.maxQty, margin = fav.margin })
+        Update()
+    else
+        local e = { itemID = itemID, itemKey = fav.itemKey, name = fav.name or ItemName(itemID) }
+        selectedBrowse = e
+        local mine = AHWatchDB.myMax and AHWatchDB.myMax[itemID]
+        maxMoney.SetValue(mine or 0)
+        pctBox:SetText("")
+        marginBox:SetText("")
+        qtyBox:SetText("0")
+        AddSelected()
+    end
+end
+
+function ns.ShowFavorites()
+    EnsureDB()
+    browseMode = "fav"
+    browse, selectedBrowse = {}, nil
+    browseOffset = 0
+    for id, fav in pairs(AHWatchDB.favorites) do
+        browse[#browse + 1] = { itemID = id, itemKey = fav.itemKey, name = fav.name or ItemName(id) }
+    end
+    table.sort(browse, function(x, y) return (x.name or "") < (y.name or "") end)
+    if #browse == 0 then Msg("no favorites yet - click the star next to any item to add it.") end
+    Update()
+end
+favBtn:SetScript("OnClick", function()
+    if browseMode == "fav" then browseMode = "search"; browse, selectedBrowse = {}, nil; Update()
+    else ns.ShowFavorites() end
+end)
+favBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:AddLine("Favorites", 1, 1, 1)
+    GameTooltip:AddLine("Shows your starred items here. + puts one on the watch list at its saved max, - takes it off (it stays a favorite).", 1, 0.9, 0.6, true)
+    GameTooltip:AddLine("Click again to close.", 0.7, 0.7, 0.7)
+    GameTooltip:Show()
+end)
+favBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+for _, b in ipairs(browseRows) do
+    b.star:SetScript("OnClick", function(self)
+        local e = self:GetParent().entry
+        if e then ToggleFavorite(e.itemID, e.name, e.itemKey) end
+    end)
+    b.toggle:SetScript("OnClick", function(self)
+        local e = self:GetParent().entry
+        if not e then return end
+        if FindWatch(e.itemID) then RemoveFromWatch(e.itemID); Update() else AddFavoriteToWatch(e.itemID) end
+    end)
+    b.toggle:SetScript("OnEnter", function(self)
+        local e = self:GetParent().entry
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:SetText(e and FindWatch(e.itemID) and "Take off the watch list" or "Put on the watch list", 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    b.toggle:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
 pctBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); AddSelected() end)
+marginBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); AddSelected() end)
 
 for _, b in ipairs(watchRows) do
+    b.star:SetScript("OnClick", function(self)
+        local w = AHWatchDB.watch[self:GetParent().index]
+        if w then ToggleFavorite(w.itemID, w.name, w.itemKey) end
+    end)
     b:SetScript("OnEnter", function(self)
         local w = AHWatchDB.watch[self.index]
         if not w then return end
@@ -2227,17 +2822,28 @@ for _, b in ipairs(watchRows) do
     end)
     b:SetScript("OnLeave", function() GameTooltip:Hide() end)
     b:SetScript("OnClick", function(self)
+        local w0 = AHWatchDB.watch[self.index]
+        if IsShiftKeyDown() then
+            if w0 then ns.SearchInAH(w0.itemID, w0.name) end
+            return
+        end
         current = self.index
         local w = AHWatchDB.watch[self.index]
+        if w and hotItemID and w.itemID ~= hotItemID then hotItemID = nil end
         if w then
             selectedWatchID = w.itemID   -- Search & buy works on this one
             -- Load it into the inputs so its max price can be changed with "Add to list"
             local e = { itemID = w.itemID, itemKey = w.itemKey, name = w.name }
+            browseMode = "search"
             browse, selectedBrowse = { e }, e
             searchBox:SetText(w.name or "")
             qtyBox:SetText(tostring(w.maxQty or 0))
             if ns.ShowGraph then ns.ShowGraph(w.itemID, MaxPriceFor(w)) end
-            if w.maxPct then
+            marginBox:SetText(w.margin and tostring(w.margin) or "")
+            if w.margin then
+                pctBox:SetText("")
+                maxMoney.SetValue(0)
+            elseif w.maxPct then
                 pctBox:SetText(tostring(w.maxPct))
                 maxMoney.SetValue(0)
             else
@@ -2250,6 +2856,7 @@ for _, b in ipairs(watchRows) do
     b.remove:SetScript("OnClick", function(self)
         local i = self:GetParent().index
         local w = AHWatchDB.watch[i]
+        if w then SaveToFavorite(w) end
         if w then runtime[w.itemID] = nil end
         if w and w.itemID == selectedWatchID then selectedWatchID = nil end
         UnfavoriteIfOurs(w)
@@ -2294,6 +2901,7 @@ end)
 -- Deal alert: the moment Watch all finds something at your price, play a
 -- sound and pulse the Buy instantly button until it's bought or gone, so
 -- you can press without having to watch the button. /ahw alert toggles it.
+do
 local dealAlerted = false
 local pulse = CreateFrame("Frame")
 pulse:Hide()
@@ -2324,6 +2932,7 @@ function ns.CheckDealAlert()
         manualBtn:SetAlpha(1)
     end
 end
+end
 -- Act the moment the key (or mouse button) goes down, not when it's let go
 goBtn:RegisterForClicks("AnyDown")
 manualBtn:RegisterForClicks("AnyDown")
@@ -2335,6 +2944,7 @@ manualBtn:SetScript("OnClick", function() if CurrentTab() == "buy" then BuyGo() 
 cancelBtn:SetScript("OnClick", CancelBuy)
 f:SetScript("OnShow", Update)
 
+
 SLASH_AHWATCH1 = "/ahw"
 SLASH_AHWATCH2 = "/ahwatch"
 SlashCmdList["AHWATCH"] = function(msg)
@@ -2344,6 +2954,70 @@ SlashCmdList["AHWATCH"] = function(msg)
     local isAlert = (msg or ""):match("^%s*alert%s*$")
     local stats = (msg or ""):match("^%s*stats%s*(%S*)")
     local ma = (msg or ""):match("^%s*avgqty%s*(%S*)")
+    local hl = (msg or ""):match("^%s*halflife%s*(%S*)")
+    local fu = (msg or ""):match("^%s*followup%s*(%S*)")
+    local wq, wp = (msg or ""):match("^%s*wall%s*(%S*)%s*(%S*)")
+    local mc = (msg or ""):match("^%s*margincap%s*(%S*)")
+    if wq then
+        EnsureDB()
+        local q, p = tonumber(wq), tonumber(wp)
+        if not q or q < 1 then
+            Msg(string.format("usage: /ahw wall <items> [percent]  (now %d items or %d%% of all listed). Where 'real supply' "
+                .. "starts: the price once that many are listed below it. Smaller = follows thin, jumpy markets; "
+                .. "bigger = ignores more cheap listings. Used by margin mode and bait flags.",
+                ns.WallQty and ns.WallQty() or 20, ns.WallPct and ns.WallPct() or 5))
+        else
+            AHWatchDB.wallQty = math.floor(q)
+            if p and p >= 0 then AHWatchDB.wallPct = p end
+            Msg(string.format("real supply now starts after %d items or %g%% of all listed, whichever is more.",
+                AHWatchDB.wallQty, AHWatchDB.wallPct or 5))
+            Update()
+        end
+        return
+    end
+    if mc then
+        EnsureDB()
+        local n = tonumber(mc)
+        if mc == "off" or n == 0 then
+            AHWatchDB.marginCap = nil
+            Msg("margin mode has no market-value cap now.")
+        elseif n and n > 0 then
+            AHWatchDB.marginCap = n
+            Msg("margin mode will never pay more than " .. n .. "% of market value.")
+        else
+            Msg("usage: /ahw margincap <percent of market>  or  /ahw margincap off  (now "
+                .. (AHWatchDB.marginCap and (AHWatchDB.marginCap .. "%") or "off") .. ")")
+        end
+        Update()
+        return
+    end
+    if fu then
+        EnsureDB()
+        local n = tonumber(fu)
+        if not n or n < 0 then
+            print("|cff33ccffAHWatch:|r usage: /ahw followup <seconds>  (currently " .. FollowupSecs()
+                .. ", 0 = off). After a buy, the button stays on that item this long instead of cycling on.")
+        else
+            AHWatchDB.followup = math.floor(n)
+            if n == 0 then hotItemID = nil end
+            print("|cff33ccffAHWatch:|r follow-up after a buy: " .. (n == 0 and "off" or (math.floor(n) .. " seconds")) .. ".")
+        end
+        return
+    end
+    if hl then
+        EnsureDB()
+        local n = tonumber(hl)
+        if not n or n <= 0 then
+            print("|cff33ccffAHWatch:|r usage: /ahw halflife <days>  (currently " .. (AHWatchDB.halfLife or 1.5)
+                .. "). How fast old prices stop counting toward market value: lower follows drops faster, higher is steadier.")
+        else
+            AHWatchDB.halfLife = n
+            if ns.ClearTypicalCache then ns.ClearTypicalCache() end
+            if ns.RefreshGraph then ns.RefreshGraph() end
+            print("|cff33ccffAHWatch:|r market value now halves an old day's weight every " .. n .. " day(s).")
+        end
+        return
+    end
     if (msg or ""):match("^%s*data%s*$") and ns.PrintData then
         ns.PrintData()
     elseif (msg or ""):match("^%s*ledger%s*$") and ns.ToggleLedger then
@@ -2371,10 +3045,6 @@ SlashCmdList["AHWATCH"] = function(msg)
         else
             print("  Your reaction: not measured yet (it's timed from the deal alert to your Buy instantly press)")
         end
-        local lat = AHWatchDB.lat or {}
-        local function ms(v) return v and string.format("%.0fms", v * 1000) or "?" end
-        print(string.format("  Search pace: one every %.2fs (won't go faster than %.2fs)%s", SearchGap(),
-            math.max(MIN_GAP, AHWatchDB.searchFloor or MIN_GAP), SearchPaused() and " - paused by the server right now" or ""))
         local sp = AHWatchDB.speed
         if sp and sp.n > 0 then
             local a, b, c = sp.ready / sp.n, sp.press / sp.n, sp.done / sp.n
@@ -2385,6 +3055,10 @@ SlashCmdList["AHWATCH"] = function(msg)
         else
             print("  Speed: not measured yet (it's timed on every purchase from spotting the deal to it going through)")
         end
+        local lat = AHWatchDB.lat or {}
+        local function ms(v) return v and string.format("%.0fms", v * 1000) or "?" end
+        print(string.format("  Search pace: one every %.2fs (won't go faster than %.2fs)%s", SearchGap(),
+            math.max(P.MIN_GAP, AHWatchDB.searchFloor or P.MIN_GAP), SearchPaused() and " - paused by the server right now" or ""))
         print(string.format("  Server response times: search %s, price check %s, purchase %s, buyout %s",
             ms(lat.search), ms(lat.quote), ms(lat.buy), ms(lat.bid)))
         print(string.format("  Gives up waiting after: search %.1fs, price check %.1fs, purchase %.1fs",
@@ -2403,11 +3077,15 @@ SlashCmdList["AHWATCH"] = function(msg)
     elseif sg then
         EnsureDB()
         local n = tonumber(sg)
-        if not n or n < MIN_GAP or n > MAX_GAP then
+        if sg == "reset" then
+            AHWatchDB.searchGap, AHWatchDB.searchFloor, AHWatchDB.searchFloorManual = nil, nil, nil
+            P.pauseUntil = 0
+            Msg(string.format("search pace reset to one every %.1fs.", SearchGap()))
+        elseif not n or n < P.MIN_GAP or n > P.MAX_GAP then
             Msg(string.format("usage: /ahw searchgap <seconds>  (%.1f-%d; now %.1f). How long to wait between auction "
-                .. "house searches. It also slows down by itself if the server says it's too fast.", MIN_GAP, MAX_GAP, SearchGap()))
+                .. "house searches (/ahw searchgap reset = back to normal). It also slows down a little by itself if the server says it's too fast.", P.MIN_GAP, P.MAX_GAP, SearchGap()))
         else
-            AHWatchDB.searchGap, AHWatchDB.searchFloor = n, n
+            AHWatchDB.searchGap, AHWatchDB.searchFloor, AHWatchDB.searchFloorManual = n, n, true
             Msg(string.format("one search every %.1fs from now on (it won't speed up past that by itself).", n))
         end
     elseif ml then
@@ -2455,290 +3133,19 @@ for _, e in ipairs({
     "COMMODITY_PRICE_UPDATED", "COMMODITY_PRICE_UNAVAILABLE", "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED",
     "AUCTION_HOUSE_THROTTLED_SYSTEM_READY", "PLAYER_MONEY", "GET_ITEM_INFO_RECEIVED",
     "AUCTION_HOUSE_PURCHASE_COMPLETED",
-    "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", "UI_ERROR_MESSAGE", "CHAT_MSG_SYSTEM",
+    "AUCTION_HOUSE_SHOW_ERROR", "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", "UI_ERROR_MESSAGE", "CHAT_MSG_SYSTEM",
 }) do
     pcall(ev.RegisterEvent, ev, e)
-end
-
--- Each event has its own function (one giant handler hit Lua's limit on
--- how many outside variables one function may use)
-local On = {}
-function On.AUCTION_HOUSE_SHOW(e, a1, a2)
-    ahOpen = true
-    bgBroken, bgMisses, bgPending = false, 0, nil
-    browsePending = false
-    favBroken, favMisses, favPending, hot, hotOrder = false, 0, nil, {}, {}
-    lastMoney = GetMoney()
-    ApplyKey()
-    f:ClearAllPoints()
-    local p = AHWatchDB.pos
-    if p then
-        f:SetPoint(p[1], UIParent, p[2], p[3], p[4])
-    elseif AuctionHouseFrame then
-        f:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, 0)
-    else
-        f:SetPoint("CENTER")
-    end
-    f:Show()
-    Update()
-    local w = AHWatchDB.watch[current] or AHWatchDB.watch[1]
-    if w and ns.ShowGraph then ns.ShowGraph(w.itemID, MaxPriceFor(w)) end
-
-end
-
-function On.AUCTION_HOUSE_CLOSED(e, a1, a2)
-    if state == "pricing" or state == "confirm" then pcall(C_AuctionHouse.CancelCommoditiesPurchase) end
-    ahOpen = false
-    purchase = nil
-    state = "idle"
-    lastSource = "watch"
-    dealOpen = {}   -- deals can't be watched while it's closed
-    lastChecked = {}
-    runtime = {}
-    ApplyKey()
-    f:Hide()
-
-end
-
-function On.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED(e, a1, a2)
-    if favPending and not browsePending then
-        FavoritesResults()
-        SearchAnswered()
-        Update()
-        return
-    end
-    -- Ignore results from the auction house's own search box
-    if not browsePending then return end
-    browsePending = false
-    browse = {}
-    local ok, results = pcall(C_AuctionHouse.GetBrowseResults)
-    browseOffset = 0
-    for _, res in ipairs((ok and results) or {}) do
-        if res.itemKey then
-            table.insert(browse, {
-                itemID = res.itemKey.itemID, itemKey = res.itemKey, order = #browse + 1,
-                minPrice = res.minPrice, name = ItemName(res.itemKey.itemID),
-            })
-        end
-    end
-    if #browse == 0 then Msg("no results.") end
-    Update()
-
-end
-
-function On.COMMODITY_SEARCH_RESULTS_UPDATED(e, a1, a2)
-    local w = FindWatch(a1)
-    local isManual = manualW and manualW.itemID == a1
-    local forSell = ns.sellSearchID == a1
-    if not w and not forSell and not isManual then return end
-    if w then w.isCommodity = true end
-    if isManual then manualW.isCommodity = true end
-    local rows = {}
-    for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(a1) or 0 do
-        local r = C_AuctionHouse.GetCommoditySearchResultInfo(a1, i)
-        if r and r.unitPrice and r.quantity then
-            table.insert(rows, { unitPrice = r.unitPrice, quantity = r.quantity, own = r.containsOwnerItem })
-        end
-    end
-    table.sort(rows, function(x, y) return x.unitPrice < y.unitPrice end)
-    if w then
-        for _, r in ipairs(rows) do
-            if not r.own then w.lowQty = r.quantity break end
-        end
-    end
-    runtime[a1] = { rows = rows, time = GetTime() }
-    lastChecked[a1] = GetTime()
-    SearchAnswered()
-    if ns.RecordRows then ns.RecordRows(a1, rows, true) end
-    if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
-    BgResults(a1)
-    if forSell and ns.OnSellResults then ns.OnSellResults(a1, rows, true) end
-    if w then TrackDeal(w) end
-    if isManual and lastSource == "manual" then ManualQuote() elseif w then AutoQuote(w) end
-    Update()
-
-end
-
-function On.ITEM_SEARCH_RESULTS_UPDATED(e, a1, a2)
-    local key = a1
-    local w = key and FindWatch(key.itemID)
-    local isManual = key and manualW and manualW.itemID == key.itemID
-    local forSell = key and ns.sellSearchID == key.itemID
-    if not w and not forSell and not isManual then return end
-    if w then w.isCommodity = false end
-    if isManual then manualW.isCommodity = false end
-    local rows = {}
-    for i = 1, C_AuctionHouse.GetNumItemSearchResults(key) or 0 do
-        local r = C_AuctionHouse.GetItemSearchResultInfo(key, i)
-        if r and r.buyoutAmount then
-            table.insert(rows, { auctionID = r.auctionID, buyout = r.buyoutAmount,
-                quantity = r.quantity or 1, own = r.containsOwnerItem })
-        end
-    end
-    table.sort(rows, function(x, y) return x.buyout / math.max(x.quantity, 1) < y.buyout / math.max(y.quantity, 1) end)
-    runtime[key.itemID] = { rows = rows, time = GetTime() }
-    lastChecked[key.itemID] = GetTime()
-    SearchAnswered()
-    if ns.RecordRows then ns.RecordRows(key.itemID, rows, false) end
-    if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
-    BgResults(key.itemID)
-    if forSell and ns.OnSellResults then ns.OnSellResults(key.itemID, rows, false) end
-    if w then TrackDeal(w) end
-    Update()
-
-end
-
-function On.COMMODITY_PRICE_UPDATED(e, a1, a2)
-    if state ~= "pricing" or not purchase then return end
-    Answered("quote")
-    local unitPrice, total = a1, a2
-    -- Safety check: the real price must still be within your max, your gold and your limit
-    if total and total <= purchase.qty * purchase.max and total <= Budget() then
-        purchase.total = total
-        purchase.quotedAt = GetTime()
-        purchase.readyAt = purchase.readyAt or purchase.quotedAt
-        purchase.auto = false   -- the automatic part is done; from here it's a normal purchase
-        SetState("confirm")
-        Timeout("confirm", 15)
-    else
-        if not purchase.auto then
-            Msg("price went up to " .. Money(unitPrice or 0) .. " each - not buying. Press again to refresh.")
-        end
-        pcall(C_AuctionHouse.CancelCommoditiesPurchase)
-        runtime[purchase.itemID] = nil
-        MarkHot(purchase.itemID)   -- search it again straight away
-        purchase = nil
-        SetState("idle")
-    end
-
-end
-
-function On.COMMODITY_PRICE_UNAVAILABLE(e, a1, a2)
-    if purchase and not purchase.auto then DealLost(purchase.itemID) end
-    if purchase then
-        runtime[purchase.itemID] = nil
-        MarkHot(purchase.itemID)
-        if not purchase.auto then Msg("those listings are gone - press again to refresh.") end
-    end
-    purchase = nil
-    SetState("idle")
-
-end
-
-function On.COMMODITY_PURCHASE_SUCCEEDED(e, a1, a2)
-    Answered("buy")
-    -- (latePurchase: it timed out and we moved on, but it went through after all)
-    local p, late = purchase or latePurchase, (purchase == nil)
-    latePurchase = nil
-    local w
-    if p then
-        spent = spent + (p.total or 0)
-        w = p.w or FindWatch(p.itemID)
-        if w then w.bought = (w.bought or 0) + p.qty end
-        if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.total or 0) end
-        Speed.Done(p.itemID, p.readyAt, p.pressAt)
-        DealBought(p.itemID)
-        Msg("bought " .. p.qty .. "x " .. (p.name or "item") .. " for " .. Money(p.total or 0) .. ".")
-        runtime[p.itemID] = nil
-    end
-    if late then
-        if Update then Update() end
-        return
-    end
-    purchase = nil
-    SetState("idle")
-    -- Search & buy: look again straight away, so the next press can buy more
-    if p and p.manual and w and not (w.maxQty and (w.bought or 0) >= w.maxQty) and not LimitReached() and Ready() then
-        Search(w, true)
-        return
-    end
-    -- Refresh straight away if you still want more, so the next press is ready to buy
-    if not (p and p.manual) and AutoSearchOn() then
-        bgLast = 0   -- Watch all refreshes it straight away
-    end
-
-end
-
-function On.COMMODITY_PURCHASE_FAILED(e, a1, a2)
-    Answered("buy")
-    latePurchase = nil
-    if purchase then
-        DealLost(purchase.itemID)
-        runtime[purchase.itemID] = nil
-        MarkHot(purchase.itemID)
-    end
-    Msg("purchase failed - press again to refresh.")
-    purchase = nil
-    SetState("idle")
-
-end
-
-function On.AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED(e, a1, a2)
-    if ahOpen then SlowDown() end
-
-end
-
-function On.UI_ERROR_MESSAGE(e, a1, a2)
-    -- (UI_ERROR_MESSAGE gives an error type then the text; chat gives the text)
-    local text = (type(a2) == "string" and a2) or (type(a1) == "string" and a1) or ""
-    if ahOpen and IsSlowDownMessage(text) then SlowDown() end
-
-end
-On.CHAT_MSG_SYSTEM = On.UI_ERROR_MESSAGE
-
-function On.AUCTION_HOUSE_PURCHASE_COMPLETED(e, a1, a2)
-    -- The server confirmed an item buyout
-    for i, p in ipairs(pendingBids) do
-        if p.auctionID == a1 then ConfirmBid(i) break end
-    end
-
-end
-
-function On.PLAYER_MONEY(e, a1, a2)
-    -- Gold going down by a buyout's price also confirms it (for clients
-    -- without the event above). Several can land in one money update.
-    local now = GetMoney()
-    if lastMoney and now < lastMoney and #pendingBids > 0 and state ~= "buying" then
-        local drop = lastMoney - now
-        while drop > 0 and #pendingBids > 0 do
-            local pick
-            for i, p in ipairs(pendingBids) do
-                if p.price == drop then pick = i break end
-            end
-            if not pick then
-                for i, p in ipairs(pendingBids) do
-                    if p.price <= drop then pick = i break end
-                end
-            end
-            if not pick then break end
-            drop = drop - pendingBids[pick].price
-            ConfirmBid(pick)
-        end
-    end
-    lastMoney = now
-    if f:IsShown() then Update() end
-
-end
-
-function On.AUCTION_HOUSE_THROTTLED_SYSTEM_READY(e, a1, a2)
-    if f:IsShown() then Update() end
-
-end
-
-function On.GET_ITEM_INFO_RECEIVED(e, a1, a2)
-    -- These come in bursts (dozens at once): redraw once when it settles
-    if f:IsShown() and not itemInfoQueued then
-        itemInfoQueued = true
-        C_Timer.After(0.2, function()
-            itemInfoQueued = false
-            if f:IsShown() then Update() end
-        end)
-    end
 end
 
 ev:SetScript("OnEvent", function(_, e, a1, a2)
     if e == "ADDON_LOADED" and a1 == "AHWatch" then
         EnsureDB()
+        -- 1.35: forget a search pace that the old, over-eager slow-down rules saved
+        if not AHWatchDB.searchPaceV2 then
+            AHWatchDB.searchPaceV2 = true
+            if not AHWatchDB.searchFloorManual then AHWatchDB.searchGap, AHWatchDB.searchFloor = nil, nil end
+        end
         -- Older versions stored the limit in whole gold
         if AHWatchDB.cap and not AHWatchDB.capCopper then
             AHWatchDB.capCopper = (tonumber(AHWatchDB.cap) or 0) * 10000
@@ -2772,6 +3179,269 @@ ev:SetScript("OnEvent", function(_, e, a1, a2)
     end
     if not AHWatchDB then return end
 
-    local h = On[e]
-    if h then h(e, a1, a2) end
+    if e == "AUCTION_HOUSE_SHOW" then
+        ahOpen = true
+        bgBroken, bgMisses, bgPending = false, 0, nil
+        browsePending = false
+        favBroken, favMisses, favPending, hot, hotOrder = false, 0, nil, {}, {}
+        lastMoney = GetMoney()
+        ApplyKey()
+        f:ClearAllPoints()
+        local p = AHWatchDB.pos
+        if p then
+            f:SetPoint(p[1], UIParent, p[2], p[3], p[4])
+        elseif AuctionHouseFrame then
+            f:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, 0)
+        else
+            f:SetPoint("CENTER")
+        end
+        f:Show()
+        Update()
+        local w = AHWatchDB.watch[current] or AHWatchDB.watch[1]
+        if w and ns.ShowGraph then ns.ShowGraph(w.itemID, MaxPriceFor(w)) end
+
+    elseif e == "AUCTION_HOUSE_CLOSED" then
+        if state == "pricing" or state == "confirm" then pcall(C_AuctionHouse.CancelCommoditiesPurchase) end
+        ahOpen = false
+        purchase = nil
+        state = "idle"
+        lastSource = "watch"
+        dealOpen = {}   -- deals can't be watched while it's closed
+        P.lastChecked = {}
+        runtime = {}
+        ApplyKey()
+        f:Hide()
+
+    elseif e == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
+        if favPending and not browsePending then
+            FavoritesResults()
+            SearchAnswered()
+            Update()
+            return
+        end
+        -- Ignore results from the auction house's own search box
+        if not browsePending then return end
+        browsePending = false
+        browse = {}
+        browseOffset = 0
+        local ok, results = pcall(C_AuctionHouse.GetBrowseResults)
+        browseOffset = 0
+        for _, res in ipairs((ok and results) or {}) do
+            if res.itemKey then
+                table.insert(browse, {
+                    itemID = res.itemKey.itemID, itemKey = res.itemKey, order = #browse + 1,
+                    minPrice = res.minPrice, name = ItemName(res.itemKey.itemID),
+                })
+            end
+        end
+        if #browse == 0 then Msg("no results.") end
+        Update()
+
+    elseif e == "COMMODITY_SEARCH_RESULTS_UPDATED" then
+        local w = FindWatch(a1)
+        local isManual = manualW and manualW.itemID == a1
+        local forSell = ns.sellSearchID == a1
+        if not w and not forSell and not isManual then return end
+        if w then w.isCommodity = true end
+        if isManual then manualW.isCommodity = true end
+        local rows = {}
+        for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(a1) or 0 do
+            local r = C_AuctionHouse.GetCommoditySearchResultInfo(a1, i)
+            if r and r.unitPrice and r.quantity then
+                table.insert(rows, { unitPrice = r.unitPrice, quantity = r.quantity, own = r.containsOwnerItem })
+            end
+        end
+        table.sort(rows, function(x, y) return x.unitPrice < y.unitPrice end)
+        if w then
+            for _, r in ipairs(rows) do
+                if not r.own then w.lowQty = r.quantity break end   -- usual cheapest listing size
+            end
+        end
+        runtime[a1] = { rows = rows, time = GetTime() }
+        P.lastChecked[a1] = GetTime()
+        if w then P.NoteWall(a1, rows) end
+        SearchAnswered()
+        if ns.RecordRows then ns.RecordRows(a1, rows, true) end
+        if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
+        BgResults(a1)
+        if forSell and ns.OnSellResults then ns.OnSellResults(a1, rows, true) end
+        if w then TrackDeal(w) end
+        if isManual and lastSource == "manual" then ManualQuote() elseif w then AutoQuote(w) end
+        Update()
+
+    elseif e == "ITEM_SEARCH_RESULTS_UPDATED" then
+        local key = a1
+        local w = key and FindWatch(key.itemID)
+        local isManual = key and manualW and manualW.itemID == key.itemID
+        local forSell = key and ns.sellSearchID == key.itemID
+        if not w and not forSell and not isManual then return end
+        if w then w.isCommodity = false end
+        if isManual then manualW.isCommodity = false end
+        local rows = {}
+        for i = 1, C_AuctionHouse.GetNumItemSearchResults(key) or 0 do
+            local r = C_AuctionHouse.GetItemSearchResultInfo(key, i)
+            if r and r.buyoutAmount then
+                table.insert(rows, { auctionID = r.auctionID, buyout = r.buyoutAmount,
+                    quantity = r.quantity or 1, own = r.containsOwnerItem })
+            end
+        end
+        table.sort(rows, function(x, y) return x.buyout / math.max(x.quantity, 1) < y.buyout / math.max(y.quantity, 1) end)
+        runtime[key.itemID] = { rows = rows, time = GetTime() }
+        P.lastChecked[key.itemID] = GetTime()
+        if w then P.NoteWall(key.itemID, rows) end
+        SearchAnswered()
+        if ns.RecordRows then ns.RecordRows(key.itemID, rows, false) end
+        if state == "searching" and (w or isManual) then state = "idle"; searchAuto = false end
+        BgResults(key.itemID)
+        if forSell and ns.OnSellResults then ns.OnSellResults(key.itemID, rows, false) end
+        if w then TrackDeal(w) end
+        Update()
+
+    else
+        ns.OnBuyEvent(e, a1, a2)
+    end
 end)
+
+-- The buying/error half of the event handler (split off: Lua allows a
+-- function only 60 outside variables)
+function ns.OnBuyEvent(e, a1, a2)
+    if e == "COMMODITY_PRICE_UPDATED" then
+        if state ~= "pricing" or not purchase then return end
+        Answered("quote")
+        local unitPrice, total = a1, a2
+        -- Safety check: the real price must still be within your max, your gold and your limit
+        if total and total <= purchase.qty * purchase.max and total <= Budget() then
+            purchase.total = total
+            purchase.quotedAt = GetTime()
+            purchase.readyAt = purchase.readyAt or purchase.quotedAt
+            purchase.auto = false   -- the automatic part is done; from here it's a normal purchase
+            SetState("confirm")
+            Timeout("confirm", 15)
+        else
+            if not purchase.auto then
+                Msg("price went up to " .. Money(unitPrice or 0) .. " each - not buying. Press again to refresh.")
+            end
+            pcall(C_AuctionHouse.CancelCommoditiesPurchase)
+            runtime[purchase.itemID] = nil
+            MarkHot(purchase.itemID)   -- search it again straight away
+            purchase = nil
+            SetState("idle")
+        end
+
+    elseif e == "COMMODITY_PRICE_UNAVAILABLE" then
+        if purchase and not purchase.auto then DealLost(purchase.itemID) end
+        if purchase then
+            runtime[purchase.itemID] = nil
+            MarkHot(purchase.itemID)
+            if not purchase.auto then Msg("those listings are gone - press again to refresh.") end
+        end
+        purchase = nil
+        SetState("idle")
+
+    elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
+        Answered("buy")
+        -- (latePurchase: it timed out and we moved on, but it went through after all)
+        local p, late = purchase or latePurchase, (purchase == nil)
+        latePurchase = nil
+        local w
+        if p then
+            spent = spent + (p.total or 0)
+            w = p.w or FindWatch(p.itemID)
+            if w then w.bought = (w.bought or 0) + p.qty end
+            if ns.AddLedger then ns.AddLedger(p.itemID, p.name, p.qty, p.total or 0) end
+            P.Speed.Done(p.itemID, p.readyAt, p.pressAt)
+            DealBought(p.itemID)
+            Msg("bought " .. p.qty .. "x " .. (p.name or "item") .. " for " .. Money(p.total or 0) .. ".")
+            runtime[p.itemID] = nil
+        end
+        if late then
+            if Update then Update() end
+            return
+        end
+        if p then StartFollowup(p.itemID) end
+        purchase = nil
+        SetState("idle")
+        -- Search & buy: look again straight away, so the next press can buy more
+        if p and p.manual and w and not (w.maxQty and (w.bought or 0) >= w.maxQty) and not LimitReached() and Ready() then
+            Search(w, true)
+            return
+        end
+        -- Refresh straight away if you still want more, so the next press is ready to buy
+        if not (p and p.manual) and AutoSearchOn() then
+            bgLast = 0   -- Watch all refreshes it straight away
+        end
+
+    elseif e == "COMMODITY_PURCHASE_FAILED" then
+        Answered("buy")
+        latePurchase = nil
+        if purchase then
+            DealLost(purchase.itemID)
+            runtime[purchase.itemID] = nil
+            MarkHot(purchase.itemID)
+        end
+        Msg("purchase failed - press again to refresh.")
+        purchase = nil
+        SetState("idle")
+
+    elseif e == "AUCTION_HOUSE_SHOW_ERROR" then
+        -- The auction house's own failure message (listing gone, already
+        -- bought, etc.). Only matters while a buy is in flight.
+        if purchase or #pendingBids > 0 then LostRace() end
+
+    elseif e == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" then
+        if ahOpen then SlowDown("request dropped") end
+
+    elseif e == "UI_ERROR_MESSAGE" or e == "CHAT_MSG_SYSTEM" then
+        -- (UI_ERROR_MESSAGE gives an error type then the text; chat gives the text)
+        local text = (type(a2) == "string" and a2) or (type(a1) == "string" and a1) or ""
+        if ahOpen and IsSlowDownMessage(text) then SlowDown("\"" .. text .. "\"") end
+        -- Some clients report a lost buy as a red on-screen error instead
+        if ahOpen and e == "UI_ERROR_MESSAGE" and (purchase or #pendingBids > 0) then
+            local t = text:lower()
+            if t:find("auction") or t:find("not found") or t:find("no longer") or t:find("sold") then LostRace() end
+        end
+
+    elseif e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
+        -- The server confirmed an item buyout
+        for i, p in ipairs(pendingBids) do
+            if p.auctionID == a1 then ConfirmBid(i) break end
+        end
+
+    elseif e == "PLAYER_MONEY" then
+        -- Gold going down by a buyout's price also confirms it (for clients
+        -- without the event above). Several can land in one money update.
+        local now = GetMoney()
+        if lastMoney and now < lastMoney and #pendingBids > 0 and state ~= "buying" then
+            local drop = lastMoney - now
+            while drop > 0 and #pendingBids > 0 do
+                local pick
+                for i, p in ipairs(pendingBids) do
+                    if p.price == drop then pick = i break end
+                end
+                if not pick then
+                    for i, p in ipairs(pendingBids) do
+                        if p.price <= drop then pick = i break end
+                    end
+                end
+                if not pick then break end
+                drop = drop - pendingBids[pick].price
+                ConfirmBid(pick)
+            end
+        end
+        lastMoney = now
+        if f:IsShown() then Update() end
+
+    elseif e == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" then
+        if f:IsShown() then Update() end
+
+    elseif e == "GET_ITEM_INFO_RECEIVED" then
+        -- These come in bursts (dozens at once): redraw once when it settles
+        if f:IsShown() and not itemInfoQueued then
+            itemInfoQueued = true
+            C_Timer.After(0.2, function()
+                itemInfoQueued = false
+                if f:IsShown() then Update() end
+            end)
+        end
+    end
+end

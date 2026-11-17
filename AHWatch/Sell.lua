@@ -23,6 +23,7 @@ local selectedID = nil
 local duration = 2           -- 1 = 2h, 2 = 8h, 3 = 24h (this client's actual AH duration tiers)
 local pendingPost = nil      -- post waiting for a price-warning confirm
 local live = {}              -- itemID -> { low = copper, qty = n, time = t } from "Check price"
+ns.liveLow = live            -- shared with the Mine tab (Mine.lua)
 
 ------------------------------------------------------------
 -- Tabs and panel
@@ -35,12 +36,30 @@ local tabSell = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
 tabSell:SetSize(54, 18)
 tabSell:SetText("Sell")
 local tabQS = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-tabQS:SetSize(78, 18)
+tabQS:SetSize(72, 18)
 tabQS:SetText("Quick Sell")
-tabQS:SetPoint("TOPRIGHT", f, "TOPRIGHT", -28, -3)
+local tabFlips = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+tabFlips:SetSize(46, 18)
+tabFlips:SetText("Deals")
+tabBuy:SetSize(42, 18)
+tabSell:SetSize(42, 18)
+-- Buy | Sell | Quick Sell | Flips, right-aligned in the title bar
+local tabMine = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+tabMine:SetSize(40, 18)
+tabMine:SetText("Mine")
+tabMine:SetPoint("TOPRIGHT", f, "TOPRIGHT", -28, -3)
+tabFlips:SetPoint("RIGHT", tabMine, "LEFT", -2, 0)
+tabQS:SetPoint("RIGHT", tabFlips, "LEFT", -2, 0)
 tabSell:SetPoint("RIGHT", tabQS, "LEFT", -2, 0)
 tabBuy:SetPoint("RIGHT", tabSell, "LEFT", -2, 0)
-for _, t in ipairs({ tabBuy, tabSell, tabQS }) do
+-- The window title moves to the left edge so it doesn't sit under the tabs
+if f.TitleText then
+    f.TitleText:ClearAllPoints()
+    f.TitleText:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -5)
+    f.TitleText:SetJustifyH("LEFT")
+end
+tabQS:SetSize(66, 18)
+for _, t in ipairs({ tabBuy, tabSell, tabQS, tabFlips, tabMine }) do
     t:SetNormalFontObject(GameFontNormalSmall)
     t:SetHighlightFontObject(GameFontHighlightSmall)
     t:SetFrameLevel(f:GetFrameLevel() + 60)
@@ -69,6 +88,12 @@ qsPanel:SetPoint("TOPLEFT", f, "TOPLEFT", 6, -26)
 qsPanel:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -6, 74)
 qsPanel:SetFrameLevel(f:GetFrameLevel() + 40)
 qsPanel:EnableMouse(true)
+-- Soak up the mouse wheel too, so scrolling over an empty spot can't reach a
+-- hidden Buy-tab price box underneath and change it
+qsPanel:EnableMouseWheel(true)
+qsPanel:SetScript("OnMouseWheel", function(_, delta)
+    if ns.ScrollQSList then ns.ScrollQSList(delta) end
+end)
 qsPanel:Hide()
 local qsPanelBase = qsPanel:CreateTexture(nil, "BACKGROUND", nil, -8)
 qsPanelBase:SetAllPoints()
@@ -76,10 +101,25 @@ qsPanelBase:SetColorTexture(0, 0, 0, 1)
 local qsPanelBg = qsPanel:CreateTexture(nil, "BACKGROUND", nil, -7)
 qsPanelBg:SetAllPoints()
 
+-- The Flips tab: every buy-low / resell-near-market opportunity, full page
+local flipsPanel = CreateFrame("Frame", "AHWatchFlipsPanel", f)
+flipsPanel:SetPoint("TOPLEFT", f, "TOPLEFT", 6, -26)
+flipsPanel:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -6, 34)
+flipsPanel:SetFrameLevel(f:GetFrameLevel() + 40)
+flipsPanel:EnableMouse(true)
+flipsPanel:Hide()
+local flipsPanelBase = flipsPanel:CreateTexture(nil, "BACKGROUND", nil, -8)
+flipsPanelBase:SetAllPoints()
+flipsPanelBase:SetColorTexture(0, 0, 0, 1)
+local flipsPanelBg = flipsPanel:CreateTexture(nil, "BACKGROUND", nil, -7)
+flipsPanelBg:SetAllPoints()
+
+-- Panel backgrounds the theme recolors (other files can add theirs)
+ns.panelBgs = { panelBg, qsPanelBg, flipsPanelBg }
 function ns.SkinSellPanel(skinned, mode)
+    ns.lastSkin = { skinned, mode }
     local function ColorBoth(r, g, b, a)
-        panelBg:SetColorTexture(r, g, b, a)
-        qsPanelBg:SetColorTexture(r, g, b, a)
+        for _, bg in ipairs(ns.panelBgs) do bg:SetColorTexture(r, g, b, a) end
     end
     if mode == "auction" then
         ColorBoth(0.055, 0.050, 0.045, 1)
@@ -90,7 +130,7 @@ function ns.SkinSellPanel(skinned, mode)
     elseif skinned then
         ColorBoth(0.067, 0.075, 0.086, 1)
     else
-        for _, bg in ipairs({ panelBg, qsPanelBg }) do
+        for _, bg in ipairs(ns.panelBgs) do
             bg:SetTexture("Interface\\DialogFrame\\UI-DialogBox-Background-Dark", "REPEAT", "REPEAT")
             bg:SetHorizTile(true)
             bg:SetVertTile(true)
@@ -156,19 +196,24 @@ local function Analyze(e)
         a.low, a.listed, a.lowTime = hist.l[2], hist.l[4], hist.l[1]
     end
 
+    -- A few items listed far under the rest are probably bait - price
+    -- against where the real supply starts, not against them
+    a.bait = ns.GetBait and ns.GetBait(e.itemID)
+    local undercutFrom = (a.bait and a.bait.floor) or a.low
+
     -- Suggested price: by default, the average of what it's actually been
     -- selling for, so you're not racing every other seller to the bottom.
     -- Switch to "Undercut" (1c under the cheapest listing) if you want the
     -- fastest possible sale instead.
     local mode = (AHWatchDB and AHWatchDB.sellMode) or "average"
-    if mode == "undercut" and a.low and a.low > 0 then
-        a.suggest = math.max(1, a.low - 1)
+    if mode == "undercut" and undercutFrom and undercutFrom > 0 then
+        a.suggest = math.max(1, undercutFrom - 1)
     elseif a.typical then
         a.suggest = a.typical
-    elseif a.low and a.low > 0 then
-        a.suggest = math.max(1, a.low - 1)   -- no saved average yet - fall back to undercut
+    elseif undercutFrom and undercutFrom > 0 then
+        a.suggest = math.max(1, undercutFrom - 1)   -- no saved average yet - fall back to undercut
     end
-    if a.low and a.typical and a.low < a.typical * DUMP_RATIO then a.dumped = true end
+    if not a.bait and a.low and a.typical and a.low < a.typical * DUMP_RATIO then a.dumped = true end
 
     if a.suggest then
         a.net = math.floor(a.suggest * (1 - AH_CUT))   -- what you actually get after the AH cut
@@ -307,7 +352,11 @@ advice:SetSpacing(2)
 
 Text(panel, "GameFontNormalSmall", 8, DY - 118):SetText("Price each:")
 -- How your price compares with the market, updated as you type
-local sellVs = Text(panel, "GameFontHighlightSmall", 74, DY - 118, 150)
+-- Two lines next to "Price each:": vs the current lowest listing on top,
+-- vs market underneath
+local sellLow = Text(panel, "GameFontHighlightSmall", 74, DY - 118, 160)
+sellLow:SetWordWrap(false)
+local sellVs = Text(panel, "GameFontHighlightSmall", 74, DY - 130, 160)
 sellVs:SetWordWrap(false)
 local modeBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
 modeBtn:SetSize(100, 18)
@@ -315,19 +364,19 @@ modeBtn:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -6, DY - 118)
 modeBtn:SetNormalFontObject(GameFontNormalSmall)
 modeBtn:SetHighlightFontObject(GameFontHighlightSmall)
 local function SellMode() return (AHWatchDB and AHWatchDB.sellMode) or "average" end
-local priceMoney = ns.MoneyInput(16, DY - 134, nil, panel)
+local priceMoney = ns.MoneyInput(16, DY - 146, nil, panel)
 local useSuggested = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
 useSuggested:SetSize(84, 18)
-useSuggested:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -6, DY - 134)
+useSuggested:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -6, DY - 146)
 useSuggested:SetText("Suggested")
 useSuggested:SetNormalFontObject(GameFontNormalSmall)
 useSuggested:SetHighlightFontObject(GameFontHighlightSmall)
 
 -- Quantity
-Text(panel, "GameFontNormalSmall", 8, DY - 166):SetText("Quantity:")
+Text(panel, "GameFontNormalSmall", 8, DY - 178):SetText("Quantity:")
 local qtyBox = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
 qtyBox:SetSize(46, 20)
-qtyBox:SetPoint("TOPLEFT", panel, "TOPLEFT", 74, DY - 162)
+qtyBox:SetPoint("TOPLEFT", panel, "TOPLEFT", 74, DY - 174)
 qtyBox:SetAutoFocus(false)
 qtyBox:SetNumeric(true)
 qtyBox:SetJustifyH("RIGHT")
@@ -343,26 +392,26 @@ local function Arrow(dir, anchorPoint, relPoint, y)
 end
 local qtyUp = Arrow("Up", "TOPLEFT", "TOPRIGHT", 1)
 local qtyDown = Arrow("Down", "BOTTOMLEFT", "BOTTOMRIGHT", -1)
-local qtyNote = Text(panel, "GameFontHighlightSmall", 142, DY - 166, 190)
+local qtyNote = Text(panel, "GameFontHighlightSmall", 142, DY - 178, 190)
 
 -- Duration
-Text(panel, "GameFontNormalSmall", 8, DY - 194):SetText("Duration:")
+Text(panel, "GameFontNormalSmall", 8, DY - 206):SetText("Duration:")
 local durBtns = {}
 for i, d in ipairs({ { 1, "2h" }, { 2, "8h" }, { 3, "24h" } }) do
     local b = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
     b:SetSize(44, 18)
-    b:SetPoint("TOPLEFT", panel, "TOPLEFT", 70 + (i - 1) * 46, DY - 191)
+    b:SetPoint("TOPLEFT", panel, "TOPLEFT", 70 + (i - 1) * 46, DY - 203)
     b:SetText(d[2])
     b:SetNormalFontObject(GameFontNormalSmall)
     b:SetHighlightFontObject(GameFontHighlightSmall)
     b.value = d[1]
     durBtns[i] = b
 end
-local depositText = Text(panel, "GameFontHighlightSmall", 8, DY - 216, 330)
+local depositText = Text(panel, "GameFontHighlightSmall", 8, DY - 228, 330)
 
 local postBtn = CreateFrame("Button", "AHWatchPostButton", panel, "UIPanelButtonTemplate")
 postBtn:SetSize(330, 26)
-postBtn:SetPoint("TOPLEFT", panel, "TOPLEFT", 8, DY - 236)
+postBtn:SetPoint("TOPLEFT", panel, "TOPLEFT", 8, DY - 248)
 postBtn.pbPrimary = true
 
 ------------------------------------------------------------
@@ -388,6 +437,8 @@ qsSearchBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 qsSearchBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
 
 local QS_ROWS = 5
+local qsOffset = 0          -- scroll position in the "Find in bags" list
+local qsMatchCount = 0
 local qsRows = {}
 for i = 1, QS_ROWS do
     local b = CreateFrame("Button", nil, qsPanel)
@@ -409,6 +460,10 @@ for i = 1, QS_ROWS do
     qsRows[i] = b
 end
 local qsEmptyText = Text(qsPanel, "GameFontDisable", 12, -74, 320)
+-- "1-5 of 23" when there are more matches than fit; scroll to see them
+local qsScrollText = qsPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+qsScrollText:SetPoint("TOPRIGHT", qsPanel, "TOPRIGHT", -8, -44)
+qsScrollText:SetJustifyH("RIGHT")
 qsEmptyText:SetText("No matching sellable items in your bags.")
 
 local QS_DY = -206
@@ -416,14 +471,22 @@ local qsSelectedText = Text(qsPanel, "GameFontNormal", 8, QS_DY, 330)
 qsSelectedText:SetText("Selected: |cffaaaaaanothing yet|r")
 
 Text(qsPanel, "GameFontNormalSmall", 8, QS_DY - 28):SetText("Price each:")
-local qsVs = Text(qsPanel, "GameFontHighlightSmall", 74, QS_DY - 28, 260)
+local qsLow = Text(qsPanel, "GameFontHighlightSmall", 74, QS_DY - 28, 260)
+qsLow:SetWordWrap(false)
+local qsVs = Text(qsPanel, "GameFontHighlightSmall", 74, QS_DY - 40, 260)
 qsVs:SetWordWrap(false)
-local qsPriceMoney = ns.MoneyInput(16, QS_DY - 44, nil, qsPanel)
+local qsPriceMoney = ns.MoneyInput(16, QS_DY - 56, nil, qsPanel)
+local qsSuggested = CreateFrame("Button", nil, qsPanel, "UIPanelButtonTemplate")
+qsSuggested:SetSize(84, 18)
+qsSuggested:SetPoint("TOPRIGHT", qsPanel, "TOPRIGHT", -6, QS_DY - 56)
+qsSuggested:SetText("Suggested")
+qsSuggested:SetNormalFontObject(GameFontNormalSmall)
+qsSuggested:SetHighlightFontObject(GameFontHighlightSmall)
 
-Text(qsPanel, "GameFontNormalSmall", 8, QS_DY - 76):SetText("Amount per press:")
+Text(qsPanel, "GameFontNormalSmall", 8, QS_DY - 88):SetText("Amount per press:")
 local qsQtyBox = CreateFrame("EditBox", nil, qsPanel, "InputBoxTemplate")
 qsQtyBox:SetSize(46, 20)
-qsQtyBox:SetPoint("TOPLEFT", qsPanel, "TOPLEFT", 112, QS_DY - 72)
+qsQtyBox:SetPoint("TOPLEFT", qsPanel, "TOPLEFT", 112, QS_DY - 84)
 qsQtyBox:SetAutoFocus(false)
 qsQtyBox:SetNumeric(true)
 qsQtyBox:SetJustifyH("RIGHT")
@@ -448,13 +511,13 @@ end
 qsQtyUp:SetScript("OnClick", function() QSStepQty(1) end)
 qsQtyDown:SetScript("OnClick", function() QSStepQty(-1) end)
 
-Text(qsPanel, "GameFontNormalSmall", 8, QS_DY - 104):SetText("Duration:")
+Text(qsPanel, "GameFontNormalSmall", 8, QS_DY - 116):SetText("Duration:")
 local qsDuration = 2   -- 1 = 2h, 2 = 8h, 3 = 24h, same tiers as the advisor tab
 local qsDurBtns = {}
 for i, d in ipairs({ { 1, "2h" }, { 2, "8h" }, { 3, "24h" } }) do
     local b = CreateFrame("Button", nil, qsPanel, "UIPanelButtonTemplate")
     b:SetSize(44, 18)
-    b:SetPoint("TOPLEFT", qsPanel, "TOPLEFT", 70 + (i - 1) * 46, QS_DY - 101)
+    b:SetPoint("TOPLEFT", qsPanel, "TOPLEFT", 70 + (i - 1) * 46, QS_DY - 113)
     b:SetText(d[2])
     b:SetNormalFontObject(GameFontNormalSmall)
     b:SetHighlightFontObject(GameFontHighlightSmall)
@@ -468,8 +531,8 @@ end
 -- around anything the server enforces.
 local qsCooldownBox = CreateFrame("CheckButton", nil, qsPanel, "UICheckButtonTemplate")
 qsCooldownBox:SetSize(22, 22)
-qsCooldownBox:SetPoint("TOPLEFT", qsPanel, "TOPLEFT", 4, QS_DY - 128)
-local qsCooldownLabel = Text(qsPanel, "GameFontNormalSmall", 26, QS_DY - 132)
+qsCooldownBox:SetPoint("TOPLEFT", qsPanel, "TOPLEFT", 4, QS_DY - 140)
+local qsCooldownLabel = Text(qsPanel, "GameFontNormalSmall", 26, QS_DY - 144)
 qsCooldownLabel:SetText("Wait between sales:")
 local qsCooldownBoxNum = CreateFrame("EditBox", nil, qsPanel, "InputBoxTemplate")
 qsCooldownBoxNum:SetSize(36, 20)
@@ -504,13 +567,26 @@ qsCooldownBoxNum:SetScript("OnEnterPressed", QSCommitCooldownSec)
 qsCooldownBoxNum:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 qsCooldownBoxNum:SetScript("OnEditFocusLost", QSCommitCooldownSec)
 
-local qsStatus = Text(qsPanel, "GameFontHighlightSmall", 8, QS_DY - 156, 330)
+local qsStatus = Text(qsPanel, "GameFontHighlightSmall", 8, QS_DY - 168, 330)
 qsStatus:SetSpacing(2)
-local qsPostedLabel = Text(qsPanel, "GameFontHighlightSmall", 8, QS_DY - 204, 330)
+local qsPostedLabel = Text(qsPanel, "GameFontHighlightSmall", 8, QS_DY - 216, 330)
 
 ------------------------------------------------------------
 -- Updating
 ------------------------------------------------------------
+
+-- Break-even from the ledger: what your unsold units of an item cost
+-- (bought with AH Watch), and the lowest price that gets that back after
+-- the 5% cut. Posting below it takes a second press, so it's never by accident.
+local function BreakEven(itemID, qty)
+    if not ns.CostBasis then return nil end
+    return ns.CostBasis(itemID, qty)
+end
+local beAck = nil   -- "itemID:price" you already confirmed posting below break-even
+local function BelowBreakEven(itemID, price, qty)
+    local each, _, be = BreakEven(itemID, qty)
+    if each and price > 0 and price < be then return be end
+end
 
 local function Selected()
     for _, e in ipairs(items) do
@@ -549,6 +625,7 @@ local function RefreshDetail()
     for i = 1, 4 do dLines[i]:SetText("") end
     if not e then
         sellVs:SetText("")
+        sellLow:SetText("")
         dName:SetText("Click an item above to see its prices.")
         advice:SetText("")
         depositText:SetText("")
@@ -572,7 +649,11 @@ local function RefreshDetail()
     end
     dLines[3]:SetText("Vendor price: " .. (a.vendor > 0 and (Money(a.vendor) .. " each, " .. Money(a.vendor * e.count) .. " for all")
         or "|cff888888can't be sold to a vendor|r"))
-    if a.net then
+    local paid, known, be = BreakEven(e.itemID, Qty() > 0 and Qty() or nil)
+    if paid then
+        dLines[4]:SetText("You paid " .. Money(paid) .. " each |cffaaaaaa(" .. known .. " unsold)|r - break-even "
+            .. Money(be) .. " after the cut")
+    elseif a.net then
         dLines[4]:SetText("You'd get after the 5% AH cut: " .. Money(a.net) .. " each, " .. Money(a.net * e.count) .. " for all")
     end
 
@@ -580,7 +661,9 @@ local function RefreshDetail()
     if a.verdict == "ah" then
         local mode = (AHWatchDB and AHWatchDB.sellMode) or "average"
         local text = "|cff33dd66Sell on the AH.|r Post at " .. Money(a.suggest) .. " each"
-        if mode == "undercut" and a.low then
+        if mode == "undercut" and a.bait then
+            text = text .. " - 1c under where the real listings start, ignoring the bait below."
+        elseif mode == "undercut" and a.low then
             text = text .. " - 1c under the cheapest, so yours sells first."
         elseif a.typical and mode ~= "undercut" then
             text = text .. " - the average price, rather than undercutting everyone else."
@@ -589,7 +672,10 @@ local function RefreshDetail()
         else
             text = text .. " (nobody else is selling it right now)."
         end
-        if a.dumped then
+        if a.bait then
+            text = text .. string.format("\n|cffffcc00Possible bait:|r only %d listed at %s, %.0f%% under the next real listings (%s). Don't undercut it.",
+                a.bait.qty, Money(a.bait.low), a.bait.pct, Money(a.bait.floor))
+        elseif a.dumped then
             text = text .. "\n|cffffd100Note:|r the cheapest listing right now is unusually low (normally about "
                 .. Money(a.typical) .. "). Someone may be dumping stock."
         end
@@ -628,8 +714,15 @@ local function RefreshDetail()
         postBtn:Enable()
     else
         local price = priceMoney.GetValue()
-        sellVs:SetText(ns.VsMarket and ns.VsMarket(e.itemID, price) or "")
-        postBtn:SetText(price > 0 and qty > 0 and ("Post " .. qty .. " for " .. Money(price) .. " each") or "Set a price and quantity")
+        local below = BelowBreakEven(e.itemID, price, qty)
+        sellVs:SetText(below and ("|cffff5555below your break-even (" .. Money(below) .. ")|r")
+            or (ns.VsMarket and ns.VsMarket(e.itemID, price) or ""))
+        sellLow:SetText(ns.VsLowest and ns.VsLowest(e.itemID, price) or "")
+        if below and beAck == (e.itemID .. ":" .. price) then
+            postBtn:SetText("Post anyway - " .. qty .. " at a loss (break-even " .. Money(below) .. ")")
+        else
+            postBtn:SetText(price > 0 and qty > 0 and ("Post " .. qty .. " for " .. Money(price) .. " each") or "Set a price and quantity")
+        end
         postBtn:SetEnabled(ns.IsAHOpen() and price > 0 and qty > 0)
     end
 end
@@ -665,11 +758,25 @@ function Refresh()
     RefreshDetail()
 end
 
+-- Prices YOU typed, per item, kept between sessions. A price box is only
+-- ever filled with your own last price for that item - never a suggestion,
+-- unless you press "Suggested" yourself.
+local function MyPrice(itemID)
+    local t = AHWatchDB and AHWatchDB.myPrices
+    return t and itemID and t[itemID] or nil
+end
+local function RememberPrice(itemID, copper)
+    if not itemID or not AHWatchDB then return end
+    AHWatchDB.myPrices = AHWatchDB.myPrices or {}
+    AHWatchDB.myPrices[itemID] = (copper and copper > 0) and copper or nil
+end
+ns.MyPrice, ns.RememberPrice = MyPrice, RememberPrice
+
 local function Select(e)
     selectedID = e.itemID
     pendingPost = nil
     e.commodity = IsCommodity(e)
-    priceMoney.SetValue(e.analysis.suggest or 0)
+    priceMoney.SetValue(MyPrice(e.itemID) or 0)
     qtyBox:SetText(tostring(e.commodity and e.count or (e.slots[1] and e.slots[1].count or 1)))
     if ns.ShowGraph then ns.ShowGraph(e.itemID, nil) end
     Refresh()
@@ -715,10 +822,10 @@ function ns.OnSellResults(itemID, rowsIn, isCommodity)
         end
     end
     live[itemID] = { low = low and math.floor(low) or nil, qty = qty, time = time() }
+    if ns.OnMineResults then ns.OnMineResults(itemID) end
     for _, e in ipairs(items) do
         if e.itemID == itemID then
             e.analysis = Analyze(e)
-            if e.itemID == selectedID and e.analysis.suggest then priceMoney.SetValue(e.analysis.suggest) end
         end
     end
     Refresh()
@@ -734,6 +841,17 @@ local function Post()
     local loc = ItemLocation:CreateFromBagAndSlot(s.bag, s.slot)
     local ok, err
     if pendingPost and not pendingPost.warned then return end   -- still waiting to hear back
+    if not pendingPost then
+        local below = BelowBreakEven(e.itemID, price, qty)
+        local key = e.itemID .. ":" .. price
+        if below and beAck ~= key then
+            beAck = key
+            Msg("that's below your break-even of " .. Money(below) .. " each (what you paid, plus the AH cut). "
+                .. "Click Post again to post it anyway.")
+            RefreshDetail()
+            return
+        end
+    end
     if pendingPost then
         local p = pendingPost
         pendingPost = nil
@@ -798,12 +916,15 @@ function RefreshQS()
     local matches = {}
     for _, e in ipairs(items) do
         if q == "" or (e.name and e.name:lower():find(q, 1, true)) then
-            table.insert(matches, e)
-            if #matches >= QS_ROWS then break end
+            matches[#matches + 1] = e
         end
     end
+    qsMatchCount = #matches
+    qsOffset = math.max(0, math.min(qsOffset, #matches - QS_ROWS))
+    qsScrollText:SetText(#matches > QS_ROWS and string.format("%d-%d of %d", qsOffset + 1,
+        math.min(qsOffset + QS_ROWS, #matches), #matches) or "")
     for i, b in ipairs(qsRows) do
-        local e = matches[i]
+        local e = matches[qsOffset + i]
         if e then
             b.icon:SetTexture(e.icon)
             b.name:SetText(e.name .. "  |cffaaaaaa(x" .. e.count .. " in bags)|r")
@@ -832,6 +953,7 @@ function RefreshQS()
 
     if not qsItemID then
         qsVs:SetText("")
+        qsLow:SetText("")
         qsSelectedText:SetText("Selected: |cffaaaaaanothing yet - click an item above|r")
         qsStatus:SetText("")
         qsPostedLabel:SetText("")
@@ -843,7 +965,11 @@ function RefreshQS()
     qsSelectedText:SetText("Selected: " .. (qsItemName or "?") .. "  |cffaaaaaa(" .. haveCount .. " in bags)|r")
 
     local price, qty = qsPriceMoney.GetValue(), QSQty()
-    qsVs:SetText(ns.VsMarket and ns.VsMarket(qsItemID, price) or "")
+    local qsBelow = BelowBreakEven(qsItemID, price, qty)
+    local qsPaid, qsKnown, qsBE = BreakEven(qsItemID, qty)
+    qsVs:SetText(qsBelow and ("|cffff5555below your break-even (" .. Money(qsBelow) .. ")|r")
+        or (ns.VsMarket and ns.VsMarket(qsItemID, price) or ""))
+    qsLow:SetText(ns.VsLowest and ns.VsLowest(qsItemID, price) or "")
     local cooldownWait = 0
     if AHWatchDB and AHWatchDB.qsCooldownEnabled then
         cooldownWait = (AHWatchDB.qsCooldownSec or 3) - (GetTime() - lastQSPost)
@@ -856,10 +982,17 @@ function RefreshQS()
         qsStatus:SetText("|cffff5555Out of " .. (qsItemName or "that item") .. " - nothing left in your bags.|r")
     elseif cooldownWait > 0 then
         qsStatus:SetText(string.format("|cff888888Waiting %.0fs before the next sale...|r", cooldownWait))
+    elseif qsBelow and beAck ~= (qsItemID .. ":" .. price) then
+        qsStatus:SetText("|cffff5555Below your break-even of " .. Money(qsBelow) .. " each.|r Press once to be warned, "
+            .. "then again to post anyway.")
     else
-        qsStatus:SetText("Ready - press your Buy-tab key to post " .. math.min(qty, haveCount) .. "x "
-            .. (qsItemName or "item") .. " at " .. Money(price) .. " each ("
+        qsStatus:SetText((qsBelow and "|cffff5555Posting at a loss.|r " or "") .. "Ready - press your Buy-tab key to post "
+            .. math.min(qty, haveCount) .. "x " .. (qsItemName or "item") .. " at " .. Money(price) .. " each ("
             .. ({ "2h", "8h", "24h" })[qsDuration] .. ").")
+    end
+    if qsPaid then
+        qsStatus:SetText(qsStatus:GetText() .. "\n|cffaaaaaaYou paid " .. Money(qsPaid) .. " each (" .. qsKnown
+            .. " unsold) - break-even " .. Money(qsBE) .. ".|r")
     end
     qsPostedLabel:SetText(((AHWatchDB and AHWatchDB.qsPosted) or 0) > 0
         and ("Posted this session: " .. (AHWatchDB.qsPosted or 0)) or "")
@@ -900,6 +1033,13 @@ function QuickSellGo()
         end
         local price = qsPriceMoney.GetValue()
         if price <= 0 then Msg("set a price each first.") return end
+        local below = BelowBreakEven(qsItemID, price, QSQty())
+        if below and beAck ~= (qsItemID .. ":" .. price) then
+            beAck = qsItemID .. ":" .. price
+            Msg("that's below your break-even of " .. Money(below) .. " each. Press again to post it anyway.")
+            RefreshQS()
+            return
+        end
         local stack = FindBestStack(qsItemID)
         if not stack or stack.count <= 0 then
             Msg("out of " .. (qsItemName or "that item") .. " - nothing left in your bags to sell.")
@@ -970,7 +1110,11 @@ ns.QuickSellGo = QuickSellGo
 ------------------------------------------------------------
 
 for _, b in ipairs(rows) do
-    b:SetScript("OnClick", function(self) if self.entry then Select(self.entry) end end)
+    b:SetScript("OnClick", function(self)
+        if not self.entry then return end
+        if IsShiftKeyDown() and ns.SearchInAH then ns.SearchInAH(self.entry.itemID, self.entry.name) return end
+        Select(self.entry)
+    end)
 end
 panel:SetScript("OnMouseWheel", function(_, delta)
     offset = math.max(0, math.min(math.max(0, #items - ROWS), offset - delta))
@@ -991,7 +1135,6 @@ modeBtn:SetScript("OnClick", function()
     local e = Selected()
     if e then
         e.analysis = Analyze(e)
-        if e.itemID == selectedID and e.analysis.suggest then priceMoney.SetValue(e.analysis.suggest) end
     end
     Refresh()
 end)
@@ -1004,7 +1147,7 @@ modeBtn:SetScript("OnEnter", function(self)
 end)
 modeBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 UpdateModeBtn()
-priceMoney.onChange = function() RefreshDetail() end
+priceMoney.onChange = function(v) RememberPrice(selectedID, v); RefreshDetail() end
 qtyBox:SetScript("OnTextChanged", function(self, userInput)
     local e = Selected()
     if userInput and e and Qty() > e.count then self:SetText(tostring(e.count)) end
@@ -1025,15 +1168,22 @@ for _, b in ipairs(durBtns) do
 end
 postBtn:SetScript("OnClick", Post)
 
-qsSearchBox:SetScript("OnTextChanged", RefreshQS)
+qsSearchBox:SetScript("OnTextChanged", function() qsOffset = 0; RefreshQS() end)
+
+-- Mouse wheel anywhere on the Quick Sell panel scrolls the bag list
+-- (Shift scrolls a whole page)
+function ns.ScrollQSList(delta)
+    local step = IsShiftKeyDown() and QS_ROWS or 1
+    qsOffset = math.max(0, math.min(math.max(0, qsMatchCount - QS_ROWS), qsOffset - delta * step))
+    RefreshQS()
+end
 for _, b in ipairs(qsRows) do
     b:SetScript("OnClick", function(self)
         if not self.entry then return end
+        if IsShiftKeyDown() and ns.SearchInAH then ns.SearchInAH(self.entry.itemID, self.entry.name) return end
         qsItemID, qsItemName, qsItemIcon = self.entry.itemID, self.entry.name, self.entry.icon
-        -- Prefill with the same suggested price the advisor tab would show,
-        -- so there's usually just the amount left to set, not the price too.
-        local a = self.entry.analysis
-        if a and a.suggest then qsPriceMoney.SetValue(a.suggest) end
+        -- Your own last price for this item, or empty - never a suggestion
+        qsPriceMoney.SetValue(MyPrice(qsItemID) or 0)
         RefreshQS()
     end)
     b:SetScript("OnEnter", function(self)
@@ -1045,20 +1195,220 @@ for _, b in ipairs(qsRows) do
     end)
     b:SetScript("OnLeave", function() GameTooltip:Hide() end)
 end
-qsPriceMoney.onChange = function() RefreshQS() end
+qsPriceMoney.onChange = function(v) RememberPrice(qsItemID, v); RefreshQS() end
+-- Only fills in the suggested price when you press it
+qsSuggested:SetScript("OnClick", function()
+    if not qsItemID then return end
+    for _, e in ipairs(items) do
+        if e.itemID == qsItemID and e.analysis and e.analysis.suggest then
+            qsPriceMoney.SetValue(e.analysis.suggest)
+            RememberPrice(qsItemID, e.analysis.suggest)
+            RefreshQS()
+            return
+        end
+    end
+end)
 qsQtyBox:SetScript("OnTextChanged", RefreshQS)
+
+------------------------------------------------------------
+-- Flips tab
+------------------------------------------------------------
+
+local FLIP_TAB_ROWS = 24
+local FLIP_ROW_H = 21
+local flipOffset = 0
+local flipList = {}
+
+local flipsIntro = Text(flipsPanel, "GameFontNormalSmall", 8, -6, 236)
+flipsIntro:SetWordWrap(false)
+-- One list of deals from your latest scan and searches, best gold first:
+-- price gaps (a few cheap items, then a jump - resell on the AH) and vendor
+-- deals (listed under what a vendor pays). "Watch" puts the item on your
+-- watch list so Buy instantly grabs it: gap deals in margin mode (the max
+-- follows real supply), vendor deals at the price shown.
+local DEAL_MARGIN = 15
+local flipsInfo = Text(flipsPanel, "GameFontDisableSmall", 8, -22, 250)
+flipsInfo:SetWordWrap(false)
+local flipsRefreshBtn = CreateFrame("Button", nil, flipsPanel, "UIPanelButtonTemplate")
+flipsRefreshBtn:SetSize(70, 18)
+flipsRefreshBtn:SetPoint("TOPRIGHT", flipsPanel, "TOPRIGHT", -6, -18)
+flipsRefreshBtn:SetText("Refresh")
+flipsRefreshBtn:SetNormalFontObject(GameFontNormalSmall)
+flipsRefreshBtn:SetHighlightFontObject(GameFontHighlightSmall)
+
+-- Column headings
+local FH = -44
+Text(flipsPanel, "GameFontNormalSmall", 26, FH, 120):SetText("Item")
+local hBuy = Text(flipsPanel, "GameFontNormalSmall", 150, FH, 60); hBuy:SetJustifyH("RIGHT"); hBuy:SetText("Buy at")
+local hSell = Text(flipsPanel, "GameFontNormalSmall", 212, FH, 60); hSell:SetJustifyH("RIGHT"); hSell:SetText("Next")
+local hPct = Text(flipsPanel, "GameFontNormalSmall", 268, FH, 34); hPct:SetJustifyH("RIGHT"); hPct:SetText("Gain")
+
+local flipTabRows = {}
+for i = 1, FLIP_TAB_ROWS do
+    local b = CreateFrame("Button", nil, flipsPanel)
+    b:SetSize(340, FLIP_ROW_H - 1)
+    b:SetPoint("TOPLEFT", flipsPanel, "TOPLEFT", 4, FH - 16 - (i - 1) * FLIP_ROW_H)
+    if i % 2 == 0 then
+        local stripe = b:CreateTexture(nil, "BACKGROUND")
+        stripe:SetAllPoints()
+        stripe:SetColorTexture(1, 1, 1, 0.04)
+    end
+    b.icon = b:CreateTexture(nil, "ARTWORK")
+    b.icon:SetSize(16, 16)
+    b.icon:SetPoint("LEFT", 2, 0)
+    b.name = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    b.name:SetPoint("LEFT", 22, 0)
+    b.name:SetWidth(122)
+    b.name:SetJustifyH("LEFT")
+    b.name:SetWordWrap(false)
+    b.buy = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    b.buy:SetPoint("LEFT", 146, 0)
+    b.buy:SetWidth(60)
+    b.buy:SetJustifyH("RIGHT")
+    b.sell = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    b.sell:SetPoint("LEFT", 208, 0)
+    b.sell:SetWidth(60)
+    b.sell:SetJustifyH("RIGHT")
+    b.pct = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    b.pct:SetPoint("LEFT", 268, 0)
+    b.pct:SetWidth(32)
+    b.pct:SetJustifyH("RIGHT")
+    b:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+    -- One click: puts it on the watch list (gap deals in margin mode) and switches to Buy
+    b.buyBtn = CreateFrame("Button", nil, b, "UIPanelButtonTemplate")
+    b.buyBtn:SetSize(40, 16)
+    b.buyBtn:SetPoint("RIGHT", b, "RIGHT", 0, 0)
+    b.buyBtn:SetText("Watch")
+    b.buyBtn:SetNormalFontObject(GameFontHighlightSmall)
+    b.buyBtn:SetHighlightFontObject(GameFontHighlightSmall)
+    b.buyBtn:SetScript("OnClick", function()
+        local fl = b.flip
+        if not fl then return end
+        local name = (C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(fl.itemID)) or ("Item " .. fl.itemID)
+        if fl.vendorFlip then
+            if ns.QuickBuySetup and ns.QuickBuySetup(fl.itemID, name, fl.current) then
+                Msg("then sell it to any vendor for " .. Money(fl.typical) .. " each - no AH cut.")
+            end
+        elseif ns.WatchWithMargin then
+            ns.WatchWithMargin(fl.itemID, name, (AHWatchDB and AHWatchDB.dealMargin) or DEAL_MARGIN)
+        end
+    end)
+    b:SetScript("OnClick", function(self)
+        if self.flip and IsShiftKeyDown() and ns.SearchInAH then ns.SearchInAH(self.flip.itemID) return end
+        if self.flip and ns.ShowGraph then ns.ShowGraph(self.flip.itemID, nil) end
+    end)
+    b:SetScript("OnEnter", function(self)
+        local fl = self.flip
+        if not fl then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetItemByID(fl.itemID)
+        GameTooltip:AddLine(" ")
+        if fl.vendorFlip then
+            GameTooltip:AddDoubleLine("Under vendor price:", fl.dealQty .. " for " .. Money(fl.dealCost), 1, 1, 1, 0.4, 1, 0.4)
+            GameTooltip:AddDoubleLine("Most you'd pay each:", Money(fl.current), 1, 1, 1, 1, 1, 1)
+            GameTooltip:AddDoubleLine("A vendor pays:", Money(fl.typical) .. " each", 1, 1, 1, 1, 1, 1)
+            GameTooltip:AddDoubleLine("Sell them to a vendor, you'd make:", Money(fl.profit) .. " (no AH cut)", 1, 1, 1, 0.4, 1, 0.4)
+            if fl.seen then
+                local mins = math.floor((time() - fl.seen) / 60)
+                GameTooltip:AddDoubleLine("Seen:", mins < 1 and "just now" or (mins .. " min ago"), 0.7, 0.7, 0.7, 0.7, 0.7, 0.7)
+            end
+            GameTooltip:AddLine("Vendor deal.  Click: show graph.  Shift-click: search it in the auction house.  Watch: add to your watch list at this price.", 0.6, 0.6, 0.6, true)
+            GameTooltip:Show()
+            return
+        end
+        GameTooltip:AddDoubleLine("Cheap group:", fl.dealQty .. " for " .. Money(fl.dealCost), 1, 1, 1, 0.4, 1, 0.4)
+        GameTooltip:AddDoubleLine("Prices:", Money(fl.low) .. " to " .. Money(fl.current), 1, 1, 1, 1, 1, 1)
+        GameTooltip:AddDoubleLine("Next listing:", Money(fl.typical), 1, 1, 1, 1, 1, 1)
+        GameTooltip:AddDoubleLine("Resell 1c under it, you'd make:", Money(fl.profit) .. " after the cut", 1, 1, 1, 0.4, 1, 0.4)
+        GameTooltip:AddDoubleLine("Listed now:", tostring(fl.qty), 1, 1, 1, 1, 1, 1)
+        if fl.seen then
+            local mins = math.floor((time() - fl.seen) / 60)
+            GameTooltip:AddDoubleLine("Seen:", mins < 1 and "just now" or (mins .. " min ago"), 0.7, 0.7, 0.7, 0.7, 0.7, 0.7)
+        end
+        GameTooltip:AddLine("Price-gap deal.  Click: show graph.  Shift-click: search it in the auction house.  Watch: add to your watch list for "
+            .. ((AHWatchDB and AHWatchDB.dealMargin) or DEAL_MARGIN) .. "% profit - its max follows the market.", 0.6, 0.6, 0.6, true)
+        GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    b:Hide()
+    flipTabRows[i] = b
+end
+
+local flipsEmpty = Text(flipsPanel, "GameFontDisable", 12, FH - 40, 320)
+flipsEmpty:SetText("No deals found in the last 6 hours.\n\nPress Full scan (Price history panel) - price gaps "
+    .. "(1-10 cheap items, then a 15%+ jump) and listings under what a vendor pays will show up here.")
+local flipsScroll = Text(flipsPanel, "GameFontDisableSmall", 8, FH - 20 - FLIP_TAB_ROWS * FLIP_ROW_H, 330)
+
+local function ShortM(c) return (ns.ShortMoney and ns.ShortMoney(c)) or Money(c) end
+
+function ns.RefreshFlipsTab()
+    if not flipsPanel:IsShown() then return end
+    flipList = {}
+    for _, fl in ipairs((ns.TopFlips and ns.TopFlips(100)) or {}) do flipList[#flipList + 1] = fl end
+    for _, fl in ipairs((ns.TopVendorFlips and ns.TopVendorFlips(100)) or {}) do flipList[#flipList + 1] = fl end
+    table.sort(flipList, function(x, y) return (x.profit or 0) > (y.profit or 0) end)
+    flipsIntro:SetText("Deals from your latest scan, best gold first:")
+    hSell:SetText("Sell at")
+    flipOffset = math.max(0, math.min(flipOffset, #flipList - FLIP_TAB_ROWS))
+    for i, b in ipairs(flipTabRows) do
+        local fl = flipList[flipOffset + i]
+        if fl then
+            b.flip = fl
+            local name = (C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(fl.itemID)) or ("Item " .. fl.itemID)
+            local icon = (C_Item and C_Item.GetItemIconByID and C_Item.GetItemIconByID(fl.itemID)) or "Interface\\Icons\\INV_Misc_QuestionMark"
+            b.icon:SetTexture(icon)
+            b.name:SetText(name .. (fl.dealQty and (" |cffaaaaaax" .. fl.dealQty .. "|r") or "")
+                .. (fl.vendorFlip and " |cffffd100(vendor)|r" or ""))
+            b.buy:SetText(ShortM(fl.current))
+            b.sell:SetText(ShortM(fl.typical))
+            b.pct:SetText(string.format("|cff33dd66+%.0f%%|r", fl.pct))
+            b:Show()
+        else
+            b.flip = nil
+            b:Hide()
+        end
+    end
+    flipsEmpty:SetShown(#flipList == 0)
+    local info = AHWatchPrices and AHWatchPrices.lastScanInfo
+    local ago = info and info.t and math.floor((time() - info.t) / 60)
+    flipsInfo:SetText(#flipList .. " found" .. (ago and ("  -  last full scan " .. (ago < 1 and "just now"
+        or ago < 120 and (ago .. " min ago") or (math.floor(ago / 60) .. " hr ago"))) or "  -  no full scan yet"))
+    flipsScroll:SetText(#flipList > FLIP_TAB_ROWS and string.format("Showing %d-%d of %d (scroll for more)",
+        flipOffset + 1, math.min(flipOffset + FLIP_TAB_ROWS, #flipList), #flipList) or "")
+end
+
+flipsPanel:EnableMouseWheel(true)
+flipsPanel:SetScript("OnMouseWheel", function(_, delta)
+    local step = IsShiftKeyDown() and FLIP_TAB_ROWS or 3
+    flipOffset = math.max(0, math.min(math.max(0, #flipList - FLIP_TAB_ROWS), flipOffset - delta * step))
+    ns.RefreshFlipsTab()
+end)
+flipsRefreshBtn:SetScript("OnClick", function() ns.RefreshFlipsTab() end)
 
 local function SetTab(name)
     if AHWatchDB then AHWatchDB.tab = name end
-    local sell, quick = (name == "sell"), (name == "quicksell")
+    -- Let go of any text box from the tab being left, so keys (and your
+    -- keybind) don't go to a box that's now hidden
+    local focus = GetCurrentKeyBoardFocus and GetCurrentKeyBoardFocus()
+    if focus and focus.ClearFocus then focus:ClearFocus() end
+    local sell, quick, flips, mine = (name == "sell"), (name == "quicksell"), (name == "flips"), (name == "mine")
+    local buy = not sell and not quick and not flips and not mine
     panel:SetShown(sell)
     qsPanel:SetShown(quick)
-    tabSell.pbPrimary, tabBuy.pbPrimary, tabQS.pbPrimary = sell, (not sell and not quick), quick
-    for _, t in ipairs({ { tabBuy, not sell and not quick }, { tabSell, sell }, { tabQS, quick } }) do
+    flipsPanel:SetShown(flips)
+    if ns.SetMineShown then ns.SetMineShown(mine) end
+    if ns.SetBuyOverlaysShown then ns.SetBuyOverlaysShown(buy) end
+    tabSell.pbPrimary, tabBuy.pbPrimary, tabQS.pbPrimary, tabFlips.pbPrimary, tabMine.pbPrimary = sell, buy, quick, flips, mine
+    for _, t in ipairs({ { tabBuy, buy }, { tabSell, sell }, { tabQS, quick }, { tabFlips, flips }, { tabMine, mine } }) do
         if t[2] then t[1]:LockHighlight() else t[1]:UnlockHighlight() end
     end
-    tabSell:SetText("Sell"); tabBuy:SetText("Buy"); tabQS:SetText("Quick Sell")   -- lets the trader look recolor them
-    if sell then
+    tabSell:SetText("Sell"); tabBuy:SetText("Buy"); tabQS:SetText("Quick Sell"); tabFlips:SetText("Deals"); tabMine:SetText("Mine")   -- lets the trader look recolor them
+    if mine then
+        -- Mine.lua fills itself in when shown
+    elseif flips then
+        flipOffset = 0
+        ns.RefreshFlipsTab()
+    elseif sell then
         ScanBags()
         Refresh()
     elseif quick then
@@ -1072,6 +1422,15 @@ end
 tabBuy:SetScript("OnClick", function() SetTab("buy") end)
 tabSell:SetScript("OnClick", function() SetTab("sell") end)
 tabQS:SetScript("OnClick", function() SetTab("quicksell") end)
+tabFlips:SetScript("OnClick", function() SetTab("flips") end)
+tabMine:SetScript("OnClick", function() SetTab("mine") end)
+tabMine:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+    GameTooltip:AddLine("My auctions", 1, 1, 1)
+    GameTooltip:AddLine("Your listings, with the ones someone has undercut first.", 1, 0.9, 0.6, true)
+    GameTooltip:Show()
+end)
+tabMine:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ns.SetTab = SetTab
 
 local ev = CreateFrame("Frame")

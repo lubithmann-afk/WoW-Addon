@@ -170,6 +170,7 @@ end
 -- undercutter's stack rather than a real market snapshot. Bumped up from 3:
 -- undercutting happens constantly, and a low threshold let those thin,
 -- undercut-heavy days outvote the normal ones.
+local DAY_OUTLIER = 3   -- a day more than 3x off the latest day's price is ignored
 local function TrustedQty(day) return (day[5] or 0) >= ((AHWatchDB and AHWatchDB.avgMinQty) or 8) end
 
 -- The "typical" price for an item: the MEDIAN, across trusted (not-too-
@@ -186,21 +187,59 @@ local function TrustedQty(day) return (day[5] or 0) >= ((AHWatchDB and AHWatchDB
 -- Worked out once per item and reused until that item gets a new price
 -- (it used to be re-sorted every time anything was redrawn).
 local typicalCache = {}
+local typicalCacheDay = nil   -- weights depend on today's date, so the cache resets daily
 function ns.ClearTypicalCache() typicalCache = {} end
 
+-- How fast old days stop counting. Each day's weight halves every this many
+-- days: with 1.5, yesterday counts ~63%, 3 days ago 25%, a week ago ~4%.
+-- Lower = follows price drops faster; higher = steadier. /ahw halflife <days>
+local DEFAULT_HALF_LIFE = 1.5
+local function HalfLife()
+    local h = AHWatchDB and tonumber(AHWatchDB.halfLife)
+    return (h and h > 0) and h or DEFAULT_HALF_LIFE
+end
+
 function ns.GetTypicalPrice(itemID)
+    local today = math.floor(time() / 86400)
+    if typicalCacheDay ~= today then typicalCache, typicalCacheDay = {}, today end
     local c = typicalCache[itemID]
     if c then return c[1] or nil, c[2] end
     local it = runtimeItems[itemID]
     local price, days
     if it and it.d then
-        local avgs = {}
-        for _, d in ipairs(it.d) do
-            if d[4] and d[4] > 0 and TrustedQty(d) then table.insert(avgs, d[4]) end
+        -- The most recent trusted day is the reference: older days more than
+        -- 3x above or below it are bad data (often saved by an older version
+        -- whose full scan used a plain average that a few overpriced
+        -- listings could blow up) and are left out. With only 2 days, one
+        -- bad day used to drag the average halfway to it.
+        local ref
+        for i = #it.d, 1, -1 do
+            local d = it.d[i]
+            if d[4] and d[4] > 0 and TrustedQty(d) then ref = d[4] break end
         end
-        if #avgs > 0 then
-            table.sort(avgs)
-            price, days = Median(avgs), #avgs
+        -- Recency-weighted median: every day still votes, but recent days
+        -- count far more. A plain median of 30 days kept the market value
+        -- high for a week or more after competition pushed prices down.
+        local hl = HalfLife()
+        local pts, totalW = {}, 0
+        for _, d in ipairs(it.d) do
+            if d[4] and d[4] > 0 and TrustedQty(d)
+                and d[4] <= ref * DAY_OUTLIER and d[4] >= ref / DAY_OUTLIER then
+                local age = math.max(0, today - (d[1] or today))
+                local w = 0.5 ^ (age / hl)
+                pts[#pts + 1] = { d[4], w }
+                totalW = totalW + w
+            end
+        end
+        if #pts > 0 then
+            table.sort(pts, function(a, b) return a[1] < b[1] end)
+            local half, cum = totalW / 2, 0
+            for _, p in ipairs(pts) do
+                cum = cum + p[2]
+                price = p[1]
+                if cum >= half then break end
+            end
+            price, days = math.floor(price), #pts
         end
     end
     typicalCache[itemID] = { price or false, days }
@@ -248,6 +287,27 @@ function ns.VsMarket(itemID, price)
         return string.format("|cff33dd66%d%% below market|r", math.floor(-pct + 0.5)) .. ms
     end
     return string.format("|cffff6666%d%% above market|r", math.floor(pct + 0.5)) .. ms
+end
+
+-- How a price compares with the current lowest listing: "5% under lowest (1s 90c)".
+-- If the cheapest few are flagged as bait, it compares with where the real
+-- listings start instead, and says "lowest real".
+function ns.VsLowest(itemID, price)
+    if not itemID or not price or price <= 0 then return "" end
+    local it = runtimeItems[itemID]
+    local bait = ns.GetBait and ns.GetBait(itemID)
+    local low = (bait and bait.floor) or (it and it.l and it.l[2])
+    if not low or low <= 0 then return "|cff888888lowest listing: not checked yet|r" end
+    local age = (it and it.l and it.l[1]) and (time() - it.l[1]) or 0
+    local tag = bait and "lowest real" or "lowest"
+    local ms = " |cffaaaaaa(" .. ns.ShortMoney(low)
+        .. (age >= 3600 and (", " .. math.floor(age / 3600) .. "h ago") or "") .. ")|r"
+    local pct = (price - low) / low * 100
+    if math.abs(pct) < 0.5 then return "|cffffffffsame as " .. tag .. "|r" .. ms end
+    if pct < 0 then
+        return string.format("|cff33dd66%d%% under %s|r", math.floor(-pct + 0.5), tag) .. ms
+    end
+    return string.format("|cffffaa33%d%% over %s|r", math.floor(pct + 0.5), tag) .. ms
 end
 
 -- Day-over-day change for an item: today's saved daily-average price vs the
@@ -319,6 +379,139 @@ end
 -- cheapest to priciest, stop once half the total quantity has been passed,
 -- and that listing's price is what most of the stack is actually selling
 -- at, however extreme the expensive tail gets.
+------------------------------------------------------------
+-- Bait detection: a handful of items listed well under where the real
+-- supply starts, posted so undercutters chase the price down. They're
+-- flagged so the Sell tab doesn't undercut them and the flip list doesn't
+-- treat them as a real market.
+------------------------------------------------------------
+
+local BAIT_MAX_QTY = 10      -- bait is a small amount (1-10 items)...
+local BAIT_GAP = 0.15        -- ...at least 15% under where real supply starts
+local BAIT_MIN_LISTED = 30   -- below this much listed, there's no "real supply" to compare with
+local BAIT_KEEP = 900        -- seconds a bait flag stays valid
+local baitInfo = {}
+
+-- Flips use CURRENT listings only, found by quantity and gap - not market value.
+-- A flip = a small cheap group (1-10 items, cheapest first) followed by a
+-- jump to the next listing. Buy the group, resell 1c under that next listing.
+local FLIP_CUT = 0.05        -- the auction house keeps 5% of a sale
+local FLIP_MIN_PCT = 12      -- buy the group + resell under the next listing must net this much
+local GAP_MAX_QTY = 10       -- the cheap group is at most this many items
+local GAP_MIN_JUMP = 0.15    -- next listing must be at least 15% above the group's top price
+local GAP_MIN_LISTED = 20    -- need a real market behind the gap
+local gapInfo = {}           -- itemID -> best gap flip in the latest data
+local vendorInfo = {}        -- itemID -> listings under the vendor's price in the latest data
+
+-- Vendor flips: listings cheaper than what a vendor pays for the item. Buy,
+-- sell to any vendor - no AH cut, no waiting. Needs at least 5% (and 1c) profit.
+local VENDOR_MIN_PCT = 5
+local function VendorPrice(itemID)
+    local v
+    if C_Item and C_Item.GetItemInfo then v = select(11, C_Item.GetItemInfo(itemID)) end
+    if not v and GetItemInfo then v = select(11, GetItemInfo(itemID)) end
+    return v or 0
+end
+ns.VendorPrice = VendorPrice
+local function VendorFromUnits(itemID, units)
+    local vendor = VendorPrice(itemID)
+    if vendor <= 0 or not units[1] or units[1][1] > vendor then return nil end
+    local limit = math.min(vendor - 1, math.floor(vendor * (1 - VENDOR_MIN_PCT / 100)))
+    local qty, cost, top = 0, 0, 0
+    for _, u in ipairs(units) do
+        if u[1] > limit then break end
+        qty, cost, top = qty + u[2], cost + u[1] * u[2], u[1]
+    end
+    if qty == 0 then return nil end
+    return { qty = qty, cost = math.floor(cost), top = math.floor(top), vendor = vendor,
+             profit = math.floor(vendor * qty - cost), t = time() }
+end
+
+-- units sorted cheapest first: { {unitPrice, qty}, ... }; total = their qty
+local function GapFromUnits(units, total)
+    if #units < 2 or total < GAP_MIN_LISTED then return nil end
+    local best, qty, cost = nil, 0, 0
+    for k = 1, #units - 1 do
+        qty = qty + units[k][2]
+        cost = cost + units[k][1] * units[k][2]
+        if qty > GAP_MAX_QTY then break end
+        local top, nextP = units[k][1], units[k + 1][1]
+        if nextP >= top * (1 + GAP_MIN_JUMP) then
+            local sellEach = math.max(1, nextP - 1) * (1 - FLIP_CUT)
+            local profit = sellEach * qty - cost
+            local pct = profit / cost * 100
+            if pct >= FLIP_MIN_PCT and (not best or profit > best.profit) then
+                best = { qty = qty, cost = math.floor(cost), low = units[1][1], top = top,
+                         next = nextP, profit = math.floor(profit), pct = pct, t = time() }
+            end
+        end
+    end
+    return best
+end
+
+-- units = { {unitPrice, qty}, ... } sorted cheapest first; total = their qty
+-- Where real supply starts ("the wall"): the price at which a meaningful
+-- amount has been passed - at least WallQty() items, or WallPct()% of
+-- everything listed, whichever is more. Below that are the small cheap
+-- groups (bait, snipes). Both numbers are settings: /ahw wall <qty> [pct]
+local function WallQty() return (AHWatchDB and AHWatchDB.wallQty) or 20 end
+local function WallPct() return (AHWatchDB and AHWatchDB.wallPct) or 5 end
+ns.WallQty, ns.WallPct = WallQty, WallPct
+
+-- units sorted cheapest first: { {unitPrice, qty}, ... }. Returns the wall
+-- price, or nil when there isn't enough listed to trust one.
+function ns.WallFromUnits(units, total)
+    if not total or total < WallQty() then return nil end
+    local depth = math.max(WallQty(), math.ceil(total * WallPct() / 100))
+    local cum = 0
+    for _, u in ipairs(units) do
+        cum = cum + u[2]
+        if cum >= depth then return u[1] end
+    end
+    return nil
+end
+
+local function BaitFromUnits(units, total)
+    if total < BAIT_MIN_LISTED or #units < 2 then return nil end
+    local wall = ns.WallFromUnits(units, total)
+    if not wall or wall <= 0 then return nil end
+    local cutoff = wall * (1 - BAIT_GAP)
+    local qty, count, low = 0, 0, nil
+    for _, u in ipairs(units) do
+        if u[1] >= cutoff then break end
+        qty, count = qty + u[2], count + 1
+        low = low or u[1]
+    end
+    -- More than a handful that cheap isn't bait - it's a real price drop
+    if count == 0 or qty > BAIT_MAX_QTY then return nil end
+    return {
+        qty = qty, count = count, low = math.floor(low), floor = math.floor(wall),
+        pct = (wall - low) / wall * 100, t = GetTime(),
+    }
+end
+
+-- Check search results directly (rows as the main window stores them)
+function ns.FindBait(rows, isCommodity)
+    local units, total = {}, 0
+    for _, r in ipairs(rows or {}) do
+        local q = r.quantity or 1
+        local unit = isCommodity and r.unitPrice or (r.buyout and r.buyout / math.max(q, 1))
+        if unit and unit > 0 and not r.own then
+            units[#units + 1] = { unit, q }
+            total = total + q
+        end
+    end
+    table.sort(units, function(a, b) return a[1] < b[1] end)
+    return BaitFromUnits(units, total)
+end
+
+-- The latest bait flag for an item, if it's recent enough to trust
+function ns.GetBait(itemID)
+    local b = itemID and baitInfo[itemID]
+    if b and GetTime() - b.t < BAIT_KEEP then return b end
+    return nil
+end
+
 function ns.RecordRows(itemID, rows, isCommodity)
     local low, qty = nil, 0
     local units = {}
@@ -342,6 +535,9 @@ function ns.RecordRows(itemID, rows, isCommodity)
             if cum >= half then break end
         end
         Record(itemID, low, typical, qty)
+        baitInfo[itemID] = BaitFromUnits(units, qty)   -- units are sorted above
+        gapInfo[itemID] = GapFromUnits(units, qty)
+        vendorInfo[itemID] = VendorFromUnits(itemID, units)
         if ns.SchedulePriceRefresh then ns.SchedulePriceRefresh() end
     end
 end
@@ -429,6 +625,18 @@ local function ProcessReplicate()
                     if cum >= half then break end
                 end
                 Record(itemID, a.low, typical, a.qty, scanTime)
+                -- Bait check and flip count from the same sorted listings
+                local units = {}
+                for i, packed in ipairs(a.v) do
+                    units[i] = { math.floor(packed / PACK), packed % PACK }
+                end
+                vendorInfo[itemID] = (#units > 0) and VendorFromUnits(itemID, units) or nil
+                if #a.v >= 2 then
+                    baitInfo[itemID] = (a.qty >= BAIT_MIN_LISTED) and BaitFromUnits(units, a.qty) or nil
+                    gapInfo[itemID] = GapFromUnits(units, a.qty)
+                else
+                    baitInfo[itemID], gapInfo[itemID] = nil, nil
+                end
                 agg[itemID] = nil
                 if clock and (recIdx % 200 == 0) and clock() - started > FRAME_BUDGET_MS then break end
             end
@@ -748,32 +956,63 @@ local MIN_FLIP_DAYS = 4      -- need at least this many days of history before
 -- routine undercutting (buying up someone's lowballed stack, which is
 -- exactly what this list is for) doesn't drag "typical" down to the
 -- undercut price itself.
+-- CURRENT data only. Before, an item needed 4+ days of saved history (so
+-- nothing showed for days), had to have averaged enough listings in the past,
+-- was compared against long-term history instead of what's listed now, and
+-- anything under 25% of market was thrown out - hiding the very outliers
+-- worth buying. Now: every item seen in the last few hours, its cheapest
+-- listing vs the typical price of everything listed in that same snapshot.
+local FLIP_FRESH = 6 * 3600      -- only snapshots from the last 6 hours (your latest scan/searches)
+-- Flips only cover gathering materials, fishing catches and other trade
+-- goods - all in WoW's Trade Goods item class (ore, stone, gems, bars,
+-- herbs, leather, hides, raw fish, cloth, elemental, etc). Gear, consumables,
+-- recipes and the rest are left out: gear varies piece to piece, so
+-- "typical" for it isn't a real resale price. Add class IDs here to allow more.
+local FLIP_ALLOW_CLASS = { [7] = true }   -- 7 = Trade Goods
+local classCache = {}
+local function SkipForFlips(itemID)
+    local c = classCache[itemID]
+    if c == nil then
+        local ok, classID
+        local getInfo = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+        if getInfo then ok, classID = pcall(function() return select(6, getInfo(itemID)) end) end
+        c = (ok and classID) or false
+        classCache[itemID] = c
+    end
+    return not (c and FLIP_ALLOW_CLASS[c])
+end
+
 local function TopFlips(n)
-    local minListedNow = (AHWatchDB and AHWatchDB.minListed) or 8
-    local minListedAvg = math.max(3, math.floor(minListedNow / 2))
+    local now = time()
     local out = {}
-    for itemID, it in pairs(runtimeItems) do
-        if it.l and it.d and #it.d >= MIN_FLIP_DAYS and it.l[2] and it.l[2] > 0
-            and (time() - it.l[1]) < MAX_FLIP_AGE
-            and (it.l[4] or 0) >= minListedNow then
-            local qtySum = 0
-            for _, d in ipairs(it.d) do qtySum = qtySum + (d[5] or 0) end
-            local avgListed = qtySum / #it.d
-            if avgListed >= minListedAvg then
-                local typical = ns.GetTypicalPrice(itemID)
-                local current = it.l[2]
-                if typical and typical > current and typical <= current * MAX_FLIP_RATIO then
-                    local netSell = typical * (1 - AH_CUT)
-                    local pct = (netSell - current) / current * 100
-                    if pct >= MIN_FLIP_PCT then
-                        table.insert(out, { itemID = itemID, current = current, typical = typical,
-                            netSell = netSell, pct = pct, qty = it.l[4] or 0, avgListed = avgListed })
-                    end
-                end
-            end
+    for itemID, g in pairs(gapInfo) do
+        if (now - g.t) < FLIP_FRESH and not SkipForFlips(itemID) then
+            local it = runtimeItems[itemID]
+            local listed = it and it.l and it.l[4] or 0
+            out[#out + 1] = { itemID = itemID, current = math.floor(g.top), typical = g.next,
+                netSell = (g.next - 1) * (1 - FLIP_CUT), pct = g.pct, qty = listed,
+                dealQty = g.qty, dealCost = g.cost, low = math.floor(g.low),
+                profit = g.profit, seen = g.t }
         end
     end
-    table.sort(out, function(a, b) return a.pct > b.pct end)
+    table.sort(out, function(a, b) return a.profit > b.profit end)
+    while #out > n do table.remove(out) end
+    return out
+end
+ns.TopFlips = TopFlips   -- also used by the Flips tab on the main window
+
+-- Vendor flips for the Flips tab: any kind of item (gear too), best gold first
+function ns.TopVendorFlips(n)
+    local now, out = time(), {}
+    for itemID, v in pairs(vendorInfo) do
+        if (now - v.t) < FLIP_FRESH then
+            local it = runtimeItems[itemID]
+            out[#out + 1] = { itemID = itemID, current = v.top, typical = v.vendor, netSell = v.vendor,
+                pct = (v.vendor * v.qty - v.cost) / math.max(1, v.cost) * 100, qty = it and it.l and it.l[4] or 0,
+                dealQty = v.qty, dealCost = v.cost, profit = v.profit, seen = v.t, vendorFlip = true }
+        end
+    end
+    table.sort(out, function(a, b) return a.profit > b.profit end)
     while #out > n do table.remove(out) end
     return out
 end
@@ -805,7 +1044,7 @@ end
 
 local flipHeader = g:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 flipHeader:SetPoint("TOPLEFT", flipBox, "TOPLEFT", 8, -8)
-flipHeader:SetText("Flip opportunities (buy low, resell near average):")
+flipHeader:SetText("Price-gap deals (Watch: follow it for 15% profit):")
 
 local flipRows = {}
 for i = 1, FLIP_ROWS do
@@ -826,9 +1065,9 @@ for i = 1, FLIP_ROWS do
     -- One-click shortcut: sets this item up on the watch list at its shown
     -- price and switches to Buy, so pressing the key is all that's left.
     b.buyBtn = CreateFrame("Button", nil, b, "UIPanelButtonTemplate")
-    b.buyBtn:SetSize(34, 14)
+    b.buyBtn:SetSize(38, 14)
     b.buyBtn:SetPoint("RIGHT", b, "RIGHT", 0, 0)
-    b.buyBtn:SetText("Buy")
+    b.buyBtn:SetText("Watch")
     b.buyBtn:SetNormalFontObject(GameFontHighlightSmall)
     b.buyBtn:SetHighlightFontObject(GameFontHighlightSmall)
     b.buyBtn.parentRow = b
@@ -836,12 +1075,13 @@ for i = 1, FLIP_ROWS do
         local row = self.parentRow
         if not row or not row.itemID then return end
         local name = (C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(row.itemID)) or ("Item " .. row.itemID)
-        if ns.QuickBuySetup then ns.QuickBuySetup(row.itemID, name, row.current) end
+        -- Margin mode: the max follows where real supply starts, so it doesn't go stale
+        if ns.WatchWithMargin then ns.WatchWithMargin(row.itemID, name, (AHWatchDB and AHWatchDB.dealMargin) or 15) end
     end)
     b.buyBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
-        GameTooltip:SetText("Sets this item up on the watch list at its shown price and switches to Buy - "
-            .. "press your key to search and buy it.", nil, nil, nil, nil, true)
+        GameTooltip:SetText("Puts this item on your watch list for 15% profit (margin mode - its max follows "
+            .. "where real supply starts) and switches to Buy.", nil, nil, nil, nil, true)
         GameTooltip:Show()
     end)
     b.buyBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -854,7 +1094,7 @@ for i = 1, FLIP_ROWS do
         GameTooltip:SetItemByID(self.itemID)
         GameTooltip:AddLine(" ")
         GameTooltip:AddDoubleLine("Buy at:", Money(self.current), 1, 1, 1, 1, 1, 1)
-        GameTooltip:AddDoubleLine("Resell near:", Money(self.typical) .. " (typical)", 1, 1, 1, 1, 1, 1)
+        GameTooltip:AddDoubleLine("Resell near:", Money(self.typical) .. " (next listing)", 1, 1, 1, 1, 1, 1)
         GameTooltip:AddDoubleLine("You'd net:", Money(self.netSell) .. " after the 5% cut", 1, 1, 1, 1, 1, 1)
         GameTooltip:AddDoubleLine("Currently listed:", tostring(self.qty), 1, 1, 1, 1, 1, 1)
         GameTooltip:Show()
@@ -866,16 +1106,19 @@ end
 
 local flipEmpty = g:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 flipEmpty:SetPoint("TOPLEFT", flipHeader, "BOTTOMLEFT", 0, -4)
-flipEmpty:SetText("None found yet - run a full scan, or check back after another.")
+flipEmpty:SetText("No gaps found - run a Full scan to check everything listed right now.")
 
 function ns.RefreshFlips()
+    if ns.RefreshFlipsTab then ns.RefreshFlipsTab() end
     local flips = TopFlips(FLIP_ROWS)
     for i = 1, FLIP_ROWS do
         local row, f = flipRows[i], flips[i]
         if f then
             row.itemID, row.current, row.typical, row.netSell, row.qty = f.itemID, f.current, f.typical, f.netSell, f.qty
             local name = (C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(f.itemID)) or ("Item " .. f.itemID)
-            row.text:SetText(string.format("%s  %s -> %s  |cff33dd66+%.0f%%|r", name, Money(f.current), Money(f.typical), f.pct))
+            local bait = ns.GetBait(f.itemID)
+            row.text:SetText(string.format("%s  %s -> %s  |cff33dd66+%.0f%%|r", name, Money(f.current), Money(f.typical), f.pct)
+                .. (bait and string.format("  |cffffcc00bait x%d|r", bait.qty) or ""))
             row:Show()
         else
             row:Hide()
@@ -1116,6 +1359,8 @@ function ns.SchedulePriceRefresh()
         if g:IsVisible() then
             ns.RefreshGraph()
             ns.RefreshFlips()
+        elseif ns.RefreshFlipsTab then
+            ns.RefreshFlipsTab()
         end
     end)
 end
@@ -1131,6 +1376,11 @@ local function AddPriceLines(tt, itemID)
     tt:AddLine("AH Watch", 0.2, 0.8, 1)
     tt:AddDoubleLine("  Latest:", Money(it.l[2]) .. "  |cffaaaaaa(" .. it.l[4] .. " listed, " .. Ago(it.l[1]) .. ")|r",
         1, 1, 1, 1, 1, 1)
+    local bait = ns.GetBait(itemID)
+    if bait then
+        tt:AddDoubleLine("  |cffffcc00Possible bait:|r", string.format("%d at %s  |cffaaaaaa(real supply from %s)|r",
+            bait.qty, Money(bait.low), Money(bait.floor)), 1, 1, 1, 1, 1, 1)
+    end
     local typical, days = ns.GetTypicalPrice(itemID)
     if typical then
         tt:AddDoubleLine("  Average:", Money(typical) .. "  |cffaaaaaa(" .. days .. " trusted day" .. (days == 1 and "" or "s") .. ")|r", 1, 1, 1, 1, 1, 1)

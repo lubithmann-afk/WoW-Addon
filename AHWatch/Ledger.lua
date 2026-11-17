@@ -16,6 +16,8 @@ local MAX_ENTRIES = 2000
 local ROWS = 14
 local ROW_H = 18
 
+local function Short(c) return ns.ShortMoney and ns.ShortMoney(c) or Money(c) end
+
 -- Money with the gold/silver/copper coin icons
 local function Coins(c)
     c = math.floor((c or 0) + 0.5)
@@ -23,10 +25,103 @@ local function Coins(c)
     return Money(c)
 end
 
+------------------------------------------------------------
+-- Pairing sales with purchases
+-- Every purchase remembers how many of it are still unsold ("left"). A sale
+-- is matched oldest-purchase-first against unsold purchases of the same
+-- item, so each sale knows exactly what those units cost you and the profit.
+-- A sale with nothing to match - loot, world drops, crafted items - isn't
+-- recorded at all.
+------------------------------------------------------------
+
+-- Takes up to `want` unsold units of an item from purchases (oldest first,
+-- only those before `upTo` in the list). Returns units matched, their cost,
+-- and which purchases they came from.
+local function TakeLots(list, id, want, upTo)
+    local taken, cost, lots = 0, 0, {}
+    if not id or want <= 0 then return 0, 0, lots end
+    for i = 1, (upTo or #list) do
+        local b = list[i]
+        if b.kind ~= "sale" and b.id == id and (b.left or 0) > 0 then
+            local take = math.min(b.left, want - taken)
+            local each = (b.c or 0) / math.max(b.q or 1, 1)
+            b.left = b.left - take
+            taken = taken + take
+            cost = cost + each * take
+            lots[#lots + 1] = { t = b.t, q = take, each = math.floor(each) }
+            if taken >= want then break end
+        end
+    end
+    return taken, math.floor(cost), lots
+end
+
+-- What your unsold stock of an item cost (from purchases made with AH
+-- Watch). With qty, it's the cost of the next `qty` units a sale would be
+-- matched against (oldest first), which is what posting them risks.
+-- Returns cost each, how many unsold units are known, and the break-even
+-- price each (the lowest price that gets your money back after the 5% cut).
+-- Nothing known (looted, crafted, bought elsewhere): returns nil.
+function ns.CostBasis(itemID, qty)
+    if not itemID or type(AHWatchDB) ~= "table" or not AHWatchDB.ledger then return nil end
+    local units, cost, counted = 0, 0, 0
+    local want = (qty and qty > 0) and qty or math.huge
+    for _, b in ipairs(AHWatchDB.ledger) do
+        if b.kind ~= "sale" and b.id == itemID and (b.left or 0) > 0 then
+            units = units + b.left
+            if counted < want then
+                local take = math.min(b.left, want - counted)
+                cost = cost + (b.c or 0) / math.max(b.q or 1, 1) * take
+                counted = counted + take
+            end
+        end
+    end
+    if counted == 0 then return nil end
+    local each = cost / counted
+    return each, units, math.ceil(each / 0.95)
+end
+
+-- One-time setup for ledgers from before pairing: works out what's still
+-- unsold and matches old sales to old purchases where it can. Nothing is
+-- deleted or changed - old sales just gain their cost/profit if they match.
+local function PairOldEntries(list)
+    if AHWatchDB.ledgerPairV1 then return end
+    AHWatchDB.ledgerPairV1 = true
+    local nameToId = {}
+    for i, e in ipairs(list) do
+        if e.kind ~= "sale" then
+            if e.left == nil then e.left = e.q or 1 end
+            if e.id and e.n then nameToId[e.n] = e.id end
+        else
+            local id = e.id or (e.n and nameToId[e.n])
+            local taken, cost, lots = TakeLots(list, id, e.q or 1, i - 1)
+            if taken > 0 then e.cost, e.lots, e.mq = cost, lots, taken end
+        end
+    end
+end
+
 local function Entries()
     if type(AHWatchDB) ~= "table" then AHWatchDB = {} end
     AHWatchDB.ledger = AHWatchDB.ledger or {}
+    PairOldEntries(AHWatchDB.ledger)
     return AHWatchDB.ledger
+end
+
+-- An item ID for a sale mail that only gave a name: look it up among buys
+local function IdFromBuys(name)
+    if not name then return nil end
+    local list = AHWatchDB and AHWatchDB.ledger or {}
+    for i = #list, 1, -1 do
+        local e = list[i]
+        if e.kind ~= "sale" and e.n == name and e.id then return e.id end
+    end
+end
+
+-- Profit on a sale that was paired with purchases (nil if it wasn't)
+local function SaleProfit(e)
+    if not e.cost then return nil end
+    local q = math.max(e.q or 1, 1)
+    local mq = e.mq or q
+    return math.floor((e.c or 0) * mq / q) - e.cost
 end
 
 local Refresh
@@ -43,8 +138,9 @@ end
 function ns.AddLedger(itemID, name, qty, total)
     if not itemID then return end
     local m = ns.MarketPrice and ns.MarketPrice(itemID)
+    Entries()
     Add({ t = time(), id = itemID, n = name, q = qty or 1, c = math.floor(total or 0),
-        m = m and math.floor(m) or nil })
+        m = m and math.floor(m) or nil, left = qty or 1 })
 end
 
 ------------------------------------------------------------
@@ -53,12 +149,39 @@ end
 
 local recentMail = {}   -- guards against counting one mail twice
 
+-- Reads one mail. GetInboxInvoiceInfo returns: type, item, buyer, bid,
+-- buyout, deposit, AH cut, money delay, eta hour, eta min, COUNT (11th).
+-- (Before 1.33 the count was read from the 10th value - the delivery
+-- minutes, usually 0 - so every sale matched nothing and was dropped.)
+local function ReadMail(index)
+    local ok, invoiceType, itemName, buyer, bid, buyout, _, cut, _, _, _, count = pcall(GetInboxInvoiceInfo, index)
+    if not ok or invoiceType ~= "seller" then return nil end
+    local okH, _, _, _, subject, money, _, daysLeft = pcall(GetInboxHeaderInfo, index)
+    if not okH then return nil end
+    return { itemName = itemName, buyer = buyer, bid = bid, buyout = buyout, cut = cut, count = count,
+             subject = subject, money = money, daysLeft = daysLeft }
+end
+
+-- Snapshot of the sold-mail in the inbox, taken whenever it changes, so a
+-- sale can still be read if its gold is already gone by the time we look
+local mailCache = {}
+local function CacheInbox()
+    mailCache = {}
+    if not GetInboxNumItems or not GetInboxInvoiceInfo then return end
+    for i = 1, (GetInboxNumItems() or 0) do
+        local m = ReadMail(i)
+        if m and m.money and m.money > 0 then mailCache[i] = m end
+    end
+end
+
 local function RecordSale(index)
     if type(index) ~= "number" or not GetInboxInvoiceInfo or not GetInboxHeaderInfo then return end
-    local ok, invoiceType, itemName, buyer, bid, buyout, _, cut, _, _, count = pcall(GetInboxInvoiceInfo, index)
-    if not ok or invoiceType ~= "seller" then return end
-    local okH, _, _, _, subject, money, _, daysLeft = pcall(GetInboxHeaderInfo, index)
-    if not okH or not money or money <= 0 then return end
+    local m = ReadMail(index)
+    if not m or not m.money or m.money <= 0 then m = mailCache[index] end
+    mailCache[index] = nil
+    if not m or not m.money or m.money <= 0 then return end
+    local itemName, buyer, bid, buyout, cut, count = m.itemName, m.buyer, m.bid, m.buyout, m.cut, m.count
+    local subject, money, daysLeft = m.subject, m.money, m.daysLeft
     local key = tostring(itemName) .. ":" .. money .. ":" .. tostring(daysLeft) .. ":" .. tostring(subject)
     if recentMail[key] and GetTime() - recentMail[key] < 60 then return end
     recentMail[key] = GetTime()
@@ -67,8 +190,18 @@ local function RecordSale(index)
         local okI, found = pcall(C_Item.GetItemInfoInstant, itemName)
         if okI and type(found) == "number" then id = found end
     end
-    Add({ kind = "sale", t = time(), id = id, n = itemName, q = tonumber(count) or 1,
-        c = money, gross = buyout or bid, cut = cut, who = buyer })
+    -- Pair with what you bought; nothing to pair with = not one of your flips
+    local list = Entries()
+    id = id or IdFromBuys(itemName)
+    local sold = tonumber(count) or 1
+    if sold < 1 then sold = 1 end
+    local taken, cost, lots = TakeLots(list, id, sold)
+    if taken <= 0 then return end
+    local f = taken / sold                  -- sold more than you bought: only the bought part counts
+    local gross = buyout or bid
+    Add({ kind = "sale", t = time(), id = id, n = itemName, q = taken,
+        c = math.floor(money * f), gross = gross and math.floor(gross * f) or nil,
+        cut = cut and math.floor(cut * f) or nil, who = buyer, cost = cost, lots = lots })
 end
 for _, fn in ipairs({ "TakeInboxMoney", "AutoLootMailItem" }) do
     if _G[fn] then pcall(hooksecurefunc, fn, RecordSale) end
@@ -101,10 +234,11 @@ local function Text(font, x, y, width, justify)
     return fs
 end
 
--- Totals: a small table - Today / 7 days / All against Spent / Earned / Net
+-- Totals: a small table - Today / 7 days / All against Spent / Earned / Profit.
+-- Profit only counts sales paired with what you paid for those items.
 local COLS = { { x = 66, w = 92 }, { x = 160, w = 92 }, { x = 254, w = 92 } }
 do
-    local heads = { "Spent", "Earned", "Net" }
+    local heads = { "Spent", "Earned", "Profit" }
     for i, c in ipairs(COLS) do Text("GameFontNormalSmall", c.x, -28, c.w, "RIGHT"):SetText(heads[i]) end
     local line = lf:CreateTexture(nil, "ARTWORK")
     line:SetColorTexture(1, 1, 1, 0.12)
@@ -230,11 +364,30 @@ for i = 1, ROWS do
             if e.cut and e.cut > 0 then GameTooltip:AddDoubleLine("AH cut:", Money(e.cut), 1, 1, 1, 1, 1, 1) end
             GameTooltip:AddDoubleLine("You got:", Money(e.c), 1, 1, 1, 0.4, 1, 0.4)
             GameTooltip:AddDoubleLine("Each (after cut):", Money(e.c / q), 1, 1, 1, 1, 1, 1)
+            local profit = SaleProfit(e)
+            if profit then
+                local mq = e.mq or q
+                GameTooltip:AddLine(" ")
+                GameTooltip:AddDoubleLine("You paid:", Money(e.cost) .. (mq < q and ("  (for " .. mq .. " of them)") or ""),
+                    1, 1, 1, 1, 0.6, 0.6)
+                local pctText = (e.cost > 0) and string.format("  (%+.0f%%)", profit / e.cost * 100) or ""
+                GameTooltip:AddDoubleLine("Profit:", (profit >= 0 and "|cff33dd66+" or "|cffff6666-")
+                    .. Money(math.abs(profit)) .. "|r" .. pctText, 1, 1, 1, 1, 1, 1)
+                for _, l in ipairs(e.lots or {}) do
+                    GameTooltip:AddDoubleLine("  from your buy on " .. date("%b %d", l.t), l.q .. " x " .. Money(l.each),
+                        0.7, 0.7, 0.7, 0.7, 0.7, 0.7)
+                end
+            else
+                GameTooltip:AddLine("No matching purchase (recorded before sales were paired with buys).", 0.6, 0.6, 0.6, true)
+            end
         else
             GameTooltip:AddDoubleLine("Bought:", date("%a %b %d, %H:%M", e.t), 1, 1, 1, 1, 1, 1)
             GameTooltip:AddDoubleLine("Amount:", tostring(q), 1, 1, 1, 1, 1, 1)
             GameTooltip:AddDoubleLine("Each:", Money(e.c / q), 1, 1, 1, 1, 1, 1)
             GameTooltip:AddDoubleLine("Total:", Money(e.c), 1, 1, 1, 1, 1, 1)
+            if e.left ~= nil then
+                GameTooltip:AddDoubleLine("Still unsold:", (e.left or 0) .. " of " .. q, 1, 1, 1, 1, 1, 1)
+            end
             if e.m then
                 GameTooltip:AddDoubleLine("Market price then:", Money(e.m) .. " each", 1, 1, 1, 1, 1, 1)
                 local deal = DealText(e.c / q, e.m)
@@ -247,6 +400,10 @@ for i = 1, ROWS do
     -- Shift-click puts the item link in chat, like anywhere else in the game
     b:SetScript("OnClick", function(self)
         local e = self.entry
+        if e and IsShiftKeyDown() and AuctionHouseFrame and AuctionHouseFrame:IsShown() and ns.SearchInAH then
+            local id = e.id or select(1, GetItemInfoInstant and GetItemInfoInstant(NameOf(e)) or nil)
+            if id then ns.SearchInAH(id, NameOf(e)) return end
+        end
         if e and IsModifiedClick and IsModifiedClick("CHATLINK") then
             local _, link = GetItemInfo(e.id or NameOf(e))
             if link and ChatEdit_InsertLink then ChatEdit_InsertLink(link) end
@@ -276,14 +433,15 @@ clearBtn:SetHighlightFontObject(GameFontHighlightSmall)
 local offset = 0
 local shown = {}   -- entries matching the filter and view, newest first
 
-local function FillTotals(r, spent, nBuy, earned, nSale)
-    local net = earned - spent
+-- Profit only counts sales paired with what you paid, so unsold stock
+-- doesn't show up as a loss
+local function FillTotals(r, spent, nBuy, earned, nSale, profit)
     r[1]:SetText(spent > 0 and Coins(spent) or "|cff666666-|r")
     r[2]:SetText(earned > 0 and Coins(earned) or "|cff666666-|r")
-    if net == 0 then
+    if profit == 0 then
         r[3]:SetText("|cff666666-|r")
     else
-        r[3]:SetText((net > 0 and "|cff33dd66+|r" or "|cffff6666-|r") .. Coins(math.abs(net)))
+        r[3]:SetText((profit > 0 and "|cff33dd66+|r" or "|cffff6666-|r") .. Coins(math.abs(profit)))
     end
 end
 
@@ -298,10 +456,11 @@ function Refresh()
     local todayStart = now - (d.hour * 3600 + d.min * 60 + d.sec)
     local weekStart = todayStart - 6 * 86400
 
-    local T = { day = { 0, 0, 0, 0 }, week = { 0, 0, 0, 0 }, all = { 0, 0, 0, 0 } }
+    local T = { day = { 0, 0, 0, 0, 0 }, week = { 0, 0, 0, 0, 0 }, all = { 0, 0, 0, 0, 0 } }
     local function Count(bucket, e)
         if e.kind == "sale" then
             bucket[3], bucket[4] = bucket[3] + e.c, bucket[4] + 1
+            bucket[5] = bucket[5] + (SaleProfit(e) or 0)
         else
             bucket[1], bucket[2] = bucket[1] + e.c, bucket[2] + 1
         end
@@ -329,8 +488,7 @@ function Refresh()
     local counts = string.format("|cffaaaaaa%d buy%s, %d sale%s%s|r", T.all[2], T.all[2] == 1 and "" or "s",
         T.all[4], T.all[4] == 1 and "" or "s", q ~= "" and " (this filter)" or "")
     if dealCount > 0 then
-        local deal = DealText(paidWithMarket, marketValue)
-        sumDeal:SetText(counts .. "  -  your buys average " .. deal)
+        sumDeal:SetText(counts .. "  -  your buys average " .. DealText(paidWithMarket, marketValue))
     else
         sumDeal:SetText(counts)
     end
@@ -346,7 +504,12 @@ function Refresh()
             b.entry = e
             b.when:SetText(date("%b %d %H:%M", e.t))
             b.icon:SetTexture(IconOf(e))
-            b.name:SetText(NameOf(e))
+            local nameText = NameOf(e)
+            local profit = (e.kind == "sale") and SaleProfit(e)
+            if profit then
+                nameText = nameText .. (profit >= 0 and "  |cff33dd66+" or "  |cffff6666-") .. Short(math.abs(profit)) .. "|r"
+            end
+            b.name:SetText(nameText)
             b.qty:SetText((e.q or 1) > 1 and (e.q .. "x") or "1")
             if e.kind == "sale" then
                 b.amount:SetText("|cff33dd66+|r" .. Coins(e.c))
@@ -360,8 +523,8 @@ function Refresh()
         end
     end
     if #list == 0 then
-        emptyText:SetText("Nothing here yet.\nPurchases made with AH Watch, and gold you collect from auction "
-            .. "house sales in your mailbox, show up here.")
+        emptyText:SetText("Nothing here yet.\nPurchases made with AH Watch show up here, and so do their sales "
+            .. "(paired with what you paid) when you collect the gold from your mailbox.")
     elseif #shown == 0 then
         emptyText:SetText("Nothing matches.")
     else
@@ -407,7 +570,10 @@ end
 -- Item names can arrive a moment after the window opens
 local ev = CreateFrame("Frame")
 pcall(ev.RegisterEvent, ev, "GET_ITEM_INFO_RECEIVED")
-ev:SetScript("OnEvent", function()
+pcall(ev.RegisterEvent, ev, "MAIL_SHOW")
+pcall(ev.RegisterEvent, ev, "MAIL_INBOX_UPDATE")
+ev:SetScript("OnEvent", function(_, e)
+    if e == "MAIL_SHOW" or e == "MAIL_INBOX_UPDATE" then CacheInbox() return end
     if lf:IsShown() and not ev.queued then
         ev.queued = true
         C_Timer.After(0.3, function() ev.queued = false; Refresh() end)
