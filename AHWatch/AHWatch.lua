@@ -470,11 +470,28 @@ end
 local function Timeout(expected, seconds)
     local token = {}
     purchaseToken = token
+    local retried = P.retrying   -- (this wait is already the second try)
+    P.retrying = nil
     C_Timer.After(seconds, function()
         if state == expected and purchaseToken == token then
             -- Steps the addon started by itself just quietly stop (the next
             -- press sends them for real); waiting on your confirm isn't stuck
             local auto = (expected == "searching" and searchAuto) or (purchase and purchase.auto)
+            -- 1.34: a search or price check with no answer is sent once more
+            -- before giving up (the server often drops one right after it
+            -- turns a purchase down)
+            if not retried and not auto and (expected == "searching" or expected == "pricing") then
+                P.retrying = true
+                if expected == "pricing" and purchase then
+                    if StartQuote(purchase.itemID, purchase.qty) then
+                        Timeout("pricing", WaitFor("quote"))
+                        return
+                    end
+                elseif expected == "searching" and P.searchW and P.Search and P.Search(P.searchW) then
+                    return
+                end
+                P.retrying = nil
+            end
             if expected == "pricing" or expected == "confirm" then
                 pcall(C_AuctionHouse.CancelCommoditiesPurchase)
             end
@@ -494,6 +511,7 @@ local function Search(w, auto)
     local key = w.itemKey or C_AuctionHouse.MakeItemKey(w.itemID)
     runtime[w.itemID] = nil
     searchAuto = auto and true or false
+    P.searchW = w
     SetState("searching")
     NoteSearch()
     local ok, err = pcall(C_AuctionHouse.SendSearchQuery, key, { { sortOrder = SORT_PRICE, reverseSort = false } }, false)
@@ -504,6 +522,25 @@ local function Search(w, auto)
     end
     Timeout("searching", WaitFor("search"))
     return true
+end
+P.Search = Search
+
+-- A press while a search or price check is on its way: if it's clearly
+-- overdue, send it again - whichever button started it. True = handled.
+function P.Nudge()
+    if state == "pricing" and purchase then
+        if P.Overdue("quote") then
+            purchase.auto = false
+            if StartQuote(purchase.itemID, purchase.qty) then Timeout("pricing", WaitFor("quote"))
+            else purchase = nil; SetState("idle") end
+        end
+        return true
+    end
+    if state == "searching" then
+        if P.Overdue("search") and P.searchW and CanSearch() then Search(P.searchW) end
+        return true
+    end
+    return false
 end
 
 ------------------------------------------------------------
@@ -1167,18 +1204,11 @@ local function BuyGo()
     if not ahOpen then Msg("open the auction house first.") return end
     if #list == 0 then Msg("add an item to your watch list first.") return end
     if state == "confirm" then NoteReaction(); ConfirmBuy() return end   -- a deal is lined up: buy it
-    if state ~= "idle" and lastSource == "manual" then return end   -- the big button is mid-search
-    -- An automatic price check the game may have ignored: this press sends it
-    -- for real - but only once it's clearly overdue. (1.31: pressing nonstop,
+    -- A search or price check the server may have dropped: this press sends
+    -- it again - but only once it's clearly overdue. (1.31: pressing nonstop,
     -- a press nearly always lands while a normal check is still on its way,
     -- and re-sending it then just started the wait over.)
-    if state == "pricing" and purchase and purchase.auto then
-        if not P.Overdue("quote") then return end
-        purchase.auto = false
-        local ok = StartQuote(purchase.itemID, purchase.qty)
-        if ok then Timeout("pricing", WaitFor("quote")) else purchase = nil; SetState("idle") end
-        return
-    end
+    if P.Nudge() then return end
     if state ~= "idle" then return end
     -- (Buying doesn't wait for the server to finish background searches)
     if LimitReached() then Msg("spend limit reached - raise it or press Reset spent.") return end
@@ -2220,17 +2250,7 @@ function ManualGo()
         CancelBuy()
     end
     if state == "confirm" and purchase and purchase.manual then ConfirmBuy() return end
-    if state == "pricing" and purchase and purchase.manual and purchase.auto then
-        if not P.Overdue("quote") then return end   -- still on its way: don't start it over
-        purchase.auto = false
-        local ok = StartQuote(purchase.itemID, purchase.qty)
-        if ok then Timeout("pricing", WaitFor("quote")) else purchase = nil; SetState("idle") end
-        return
-    end
-    if state == "searching" and searchAuto and lastSource == "manual" then
-        if P.Overdue("search") and Ready() then Search(w) end
-        return
-    end
+    if P.Nudge() then return end   -- (overdue: sent again; on its way: wait)
     if state ~= "idle" then return end
     if LimitReached() then Msg("spend limit reached - raise it or press Reset spent.") return end
     lastSource = "manual"
