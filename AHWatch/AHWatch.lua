@@ -251,7 +251,7 @@ local function CanSearch() return SearchWait() <= 0 and Ready() end
 ------------------------------------------------------------
 
 P.sentAt = {}
-P.WAIT_LIMITS = { search = { 1.5, 6 }, quote = { 1.5, 3 }, buy = { 2, 5 }, bid = { 3, 8 } }
+P.WAIT_LIMITS = { search = { 1.5, 6 }, quote = { 1.5, 3 }, buy = { 1.3, 4 }, bid = { 3, 8 } }
 
 local function NoteLatency(kind, secs)
     if not secs or secs <= 0 or secs > 15 then return end
@@ -277,7 +277,11 @@ local function WaitFor(kind)
     local lim = P.WAIT_LIMITS[kind]
     local l = AHWatchDB and AHWatchDB.lat and AHWatchDB.lat[kind]
     if not l then return lim[2] end
-    return math.max(lim[1], math.min(lim[2], l * 3 + 0.5))
+    -- (1.35: a buy is given up on at about 2x its usual time, not 3x - a
+    -- late success is still counted, and a lost one no longer blocks you)
+    local mult, pad = 3, 0.5
+    if kind == "buy" then mult, pad = 2, 0.3 end
+    return math.max(lim[1], math.min(lim[2], l * mult + pad))
 end
 
 local function NoteSearch()
@@ -495,7 +499,13 @@ local function Timeout(expected, seconds)
             if expected == "pricing" or expected == "confirm" then
                 pcall(C_AuctionHouse.CancelCommoditiesPurchase)
             end
-            if expected == "buying" then latePurchase = purchase end
+            if expected == "buying" then
+                latePurchase = purchase
+                if purchase and P.Recover then
+                    local id = purchase.itemID
+                    C_Timer.After(0, function() P.Recover(id) end)
+                end
+            end
             purchase = nil
             searchAuto = false
             if expected ~= "confirm" and not auto and lastSource == "manual" then MoveOn() end
@@ -875,19 +885,39 @@ local function OnBuyTab()
     return not (AHWatchDB and AHWatchDB.tab) or AHWatchDB.tab == "buy"
 end
 
+-- 1.35: after a lost buy, search that item again at once - or the moment
+-- search pacing allows - so fresh prices are already there for the next
+-- press, whether or not Watch all is on. (Nothing is bought without a press.)
+function P.Recover(itemID)
+    local w = itemID and FindWatch(itemID)
+    if not w then return end
+    if P.MarkHot then P.MarkHot(itemID) end
+    local function go()
+        if state == "idle" and ahOpen and OnBuyTab() and not runtime[itemID] and FindWatch(itemID) then
+            if CanSearch() then Search(w, true) return true end
+        end
+    end
+    if go() then return end
+    local token = {}
+    P.recoverToken = token
+    C_Timer.After(math.max(0.05, SearchWait() + 0.02), function()
+        if P.recoverToken == token then P.recoverToken = nil; go() end
+    end)
+end
+
 local function LostRace(why)
     if purchase and (state == "pricing" or state == "confirm" or state == "buying") then
         if not purchase.auto then DealLost(purchase.itemID) end
         if state == "buying" then P.Speed.Lost(purchase.itemID, purchase.readyAt, purchase.pressAt) end
         if state ~= "buying" then pcall(C_AuctionHouse.CancelCommoditiesPurchase) end
-        local w = FindWatch(purchase.itemID)
-        runtime[purchase.itemID] = nil
+        local id = purchase.itemID
+        runtime[id] = nil
         Msg((purchase.name or "that item") .. ": " .. (why or "someone else got there first") .. " - refreshing.")
         purchase, latePurchase = nil, nil
         purchaseToken = nil       -- cancels the pending timeout
         searchAuto = false
         SetState("idle")
-        if w and Ready() and OnBuyTab() then Search(w, true) end
+        P.Recover(id)
         return true
     end
     -- An item buyout that failed: settle the oldest unconfirmed one now
@@ -896,7 +926,7 @@ local function LostRace(why)
     if p then
         FailBid(p)
         runtime[p.itemID] = nil
-        if state == "idle" and p.w and AHWatchDB.watch[current] == p.w and Ready() and OnBuyTab() then Search(p.w, true) end
+        P.Recover(p.itemID)
         return true
     end
 end
@@ -1008,6 +1038,7 @@ end
 local function MarkHot(itemID)
     if not hot[itemID] then hot[itemID] = true; table.insert(hotOrder, itemID) end
 end
+P.MarkHot = MarkHot
 
 -- Favorites results: queue up the items worth a full search
 -- 1.28: a stackable item the scan shows at or under your max gets its price
@@ -3437,10 +3468,12 @@ function ns.OnBuyEvent(e, a1, a2)
         if purchase then
             runtime[purchase.itemID] = nil
             MarkHot(purchase.itemID)
-            if not purchase.auto then Msg("those listings are gone - press again to refresh.") end
+            if not purchase.auto then Msg("those listings are gone - refreshing.") end
         end
+        local id = purchase and purchase.itemID
         purchase = nil
         SetState("idle")
+        P.Recover(id)
 
     elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
         Answered("buy")
@@ -3482,11 +3515,12 @@ function ns.OnBuyEvent(e, a1, a2)
             DealLost(purchase.itemID)
             P.Speed.Lost(purchase.itemID, purchase.readyAt, purchase.pressAt)
             runtime[purchase.itemID] = nil
-            MarkHot(purchase.itemID)
         end
-        Msg("purchase failed - press again to refresh.")
+        Msg((purchase and purchase.name or "that item") .. ": someone else got there first - refreshing.")
+        local id = purchase and purchase.itemID
         purchase = nil
         SetState("idle")
+        P.Recover(id)
 
     elseif e == "AUCTION_HOUSE_SHOW_ERROR" then
         -- The auction house's own failure message (listing gone, already
